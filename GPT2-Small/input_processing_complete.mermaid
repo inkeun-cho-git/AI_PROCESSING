@@ -26,7 +26,7 @@ graph TD
     end
     
     subgraph "3. POSITION EMBEDDING"
-        PE1[Sequence Length L=2<br/>Generate positions<br/>[0, 1]]
+        PE1[Sequence Length L=2<br/>Generate positions<br/>&#91;0, 1&#93;]
         PE2[Position IDs<br/>Shape: 1×2<br/>&#91;&#91;0, 1&#93;&#93;]
         PE3[Position Matrix P<br/>Shape: 1024×768<br/>Params: 786,432<br/>Learnable: Yes]
         PE4[Lookup Operation<br/>P&#91;0,:&#93; → 768 floats<br/>P&#91;1,:&#93; → 768 floats<br/>Operation: Index Select]
