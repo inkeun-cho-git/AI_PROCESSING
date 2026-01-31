@@ -1,0 +1,1678 @@
+# GPT-2 Small Complete Forward Pass 상세 분석
+
+## 목차
+1. [Input Processing](#1-input-processing)
+   - 1.1 [Tokenization (BPE)](#11-tokenization-bpe)
+   - 1.2 [Token Embedding](#12-token-embedding)
+   - 1.3 [Position Embedding](#13-position-embedding)
+   - 1.4 [Embedding Addition](#14-embedding-addition)
+2. [Transformer Blocks (×12)](#2-transformer-blocks)
+   - 2.1 [Layer Normalization 1](#21-layer-normalization-1)
+   - 2.2 [Multi-Head Self-Attention](#22-multi-head-self-attention)
+   - 2.3 [Residual Connection 1](#23-residual-connection-1)
+   - 2.4 [Layer Normalization 2](#24-layer-normalization-2)
+   - 2.5 [Feed-Forward Network (MLP)](#25-feed-forward-network-mlp)
+   - 2.6 [Residual Connection 2](#26-residual-connection-2)
+3. [Output Processing](#3-output-processing)
+   - 3.1 [Final Layer Normalization](#31-final-layer-normalization)
+   - 3.2 [Language Model Head](#32-language-model-head)
+   - 3.3 [Softmax & Sampling](#33-softmax--sampling)
+4. [전체 파이프라인 종합](#4-전체-파이프라인-종합)
+
+---
+
+## 모델 개요
+
+```
+GPT-2 Small Specifications:
+├─ Total Parameters: 124,439,808 (124M)
+├─ Hidden Size (d_model): 768
+├─ Number of Layers: 12
+├─ Attention Heads: 12
+├─ Head Dimension (d_k): 64
+├─ FFN Hidden Size: 3,072 (4 × 768)
+├─ Vocabulary Size: 50,257
+├─ Max Sequence Length: 1,024
+└─ Activation: GELU
+```
+
+---
+
+## 1. Input Processing
+
+### 1.1 Tokenization (BPE)
+
+**개요:** Byte Pair Encoding으로 텍스트를 토큰 ID 시퀀스로 변환
+
+**입력/출력:**
+```
+Input:  "Hello world" (텍스트 문자열)
+Output: [15496, 995] (토큰 ID 배열)
+```
+
+**처리 과정:**
+
+```python
+# Step 1: UTF-8 인코딩
+text = "Hello world"
+bytes_list = [72, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100]
+
+# Step 2: Byte-to-Unicode 매핑
+initial_tokens = ['H', 'e', 'l', 'l', 'o', 'Ġ', 'w', 'o', 'r', 'l', 'd']
+
+# Step 3: BPE 병합 규칙 적용 (반복)
+# Iteration 1: ['He', 'l', 'l', 'o', 'Ġ', 'w', 'o', 'r', 'l', 'd']
+# Iteration 2: ['He', 'll', 'o', 'Ġ', 'wo', 'r', 'l', 'd']
+# ...
+# Final: ['Hello', 'Ġworld']
+
+# Step 4: Vocabulary 룩업
+token_ids = [15496, 995]
+```
+
+**수학적 표현:**
+```
+T: Σ* → ℕ^L
+T(text) = [t₁, t₂, ..., t_L]
+where tᵢ ∈ {0, 1, ..., 50256}
+```
+
+**하드웨어 분석:**
+
+```
+CPU Implementation:
+├─ UTF-8 encoding: ~50-100 cycles
+├─ BPE merging: ~5,000-10,000 cycles per word
+│  └─ Hash table lookups (merge rules)
+│  └─ String concatenation
+├─ Vocabulary lookup: ~100-200 cycles per token
+└─ Total: ~2-4 μs for "Hello world"
+
+GPU Implementation:
+├─ NOT suitable (sequential algorithm)
+├─ String operations non-parallelizable
+└─ Overhead >> computation time
+
+NPU Implementation:
+├─ NOT applicable (no matrix operations)
+└─ CPU preprocessing required
+
+Recommendation: Always use CPU for tokenization
+```
+
+---
+
+### 1.2 Token Embedding
+
+**개요:** 토큰 ID를 768차원 벡터로 변환 (Lookup table)
+
+**입력/출력:**
+```
+Input:  [B, L] = [1, 2] (token IDs)
+Output: [B, L, 768] = [1, 2, 768] (embeddings)
+```
+
+**수학적 정의:**
+```
+E ∈ ℝ^(50257 × 768)  (Embedding matrix)
+h_token[b, l] = E[x[b, l]]
+
+Parameters: 50,257 × 768 = 38,597,376 (31% of total)
+Memory (FP32): 154 MB
+```
+
+**처리 과정:**
+```python
+# Embedding matrix (learned parameters)
+E = torch.randn(50257, 768)  # [vocab_size, d_model]
+
+# Input token IDs
+token_ids = torch.tensor([[15496, 995]])  # [B, L] = [1, 2]
+
+# Embedding lookup (indexing operation)
+token_embeddings = E[token_ids]  # [1, 2, 768]
+
+# Equivalent to:
+token_embeddings[0, 0] = E[15496]  # [768] - "Hello"
+token_embeddings[0, 1] = E[995]    # [768] - "world"
+```
+
+**구체적 예시:**
+```
+Token ID 15496 ("Hello"):
+E[15496] = [0.234, -0.891, 0.456, ..., -0.123]  # 768 values
+
+Token ID 995 ("world"):
+E[995] = [-0.567, 0.123, -0.789, ..., 0.456]
+
+Output shape: [1, 2, 768]
+[
+  [  # Batch 0
+    [0.234, -0.891, ..., -0.123],  # Token 0: "Hello"
+    [-0.567, 0.123, ..., 0.456]    # Token 1: "world"
+  ]
+]
+```
+
+**하드웨어 연산 분석:**
+
+```
+Operation Type: Indexed Memory Read
+
+CPU (Intel Xeon):
+├─ Per token: Random memory access to 3 KB
+├─ Cache behavior: Poor (random access pattern)
+├─ L3 cache hit: ~2,160 cycles (~0.9 μs @ 2.5 GHz)
+├─ DRAM miss: ~12,000 cycles (~5 μs)
+├─ For L=1024: ~1 ms (DRAM-bound)
+└─ Effective bandwidth: ~10 GB/s (20% of peak)
+
+GPU (NVIDIA A100):
+├─ Parallel lookup: All 1024 tokens simultaneously
+├─ Memory coalescing: Difficult (random token IDs)
+├─ L2 cache: 40 MB (stores ~13K token embeddings)
+├─ HBM bandwidth: 900 GB/s → ~3 MB / 900 GB/s = 3.3 μs
+├─ Actual: ~10-15 μs (cache misses)
+└─ Speedup: 100× vs CPU
+
+NPU (Apple Neural Engine):
+├─ DMA-based lookup (multiple channels)
+├─ On-chip cache: Top-K frequent tokens (K~2000)
+│  └─ Covers ~90% of token usage (Zipf distribution)
+├─ Cache hit: ~10-20 cycles (SRAM)
+├─ Cache miss: ~500-1000 cycles (DRAM)
+├─ For L=1024: ~30-50 μs
+├─ Quantization (INT8): 4× faster, 4× less memory
+└─ Power: 0.5 W (vs 50 W GPU) - 100× more efficient
+
+Memory Bandwidth (L=1024):
+├─ Data size: 1024 × 768 × 4 bytes = 3 MB
+├─ CPU: 3 MB / 10 GB/s = 300 μs
+├─ GPU: 3 MB / 900 GB/s = 3.3 μs
+└─ NPU (cached): 3 MB / 100 GB/s = 30 μs
+```
+
+---
+
+### 1.3 Position Embedding
+
+**개요:** 각 토큰의 위치 정보를 768차원 벡터로 인코딩
+
+**입력/출력:**
+```
+Input:  position indices [0, 1, 2, ..., L-1]
+Output: [B, L, 768] position embeddings
+```
+
+**수학적 정의:**
+```
+P ∈ ℝ^(1024 × 768)  (Position embedding matrix)
+h_pos[b, l] = P[l]
+
+Parameters: 1,024 × 768 = 786,432
+Memory (FP32): 3.1 MB
+```
+
+**처리 과정:**
+```python
+# Position embedding matrix (learned parameters)
+P = torch.randn(1024, 768)  # [max_seq_len, d_model]
+
+# Generate position indices
+seq_len = 2
+position_ids = torch.arange(seq_len)  # [0, 1]
+
+# Embedding lookup
+position_embeddings = P[position_ids]  # [2, 768]
+
+# Add batch dimension
+position_embeddings = position_embeddings.unsqueeze(0)  # [1, 2, 768]
+```
+
+**GPT-2 vs Original Transformer:**
+```
+GPT-2: Learned Position Embeddings
+├─ P is a learned parameter matrix
+├─ More flexible, data-driven
+└─ Better performance (empirically)
+
+Original Transformer: Sinusoidal Position Encoding
+├─ Fixed mathematical formula:
+│   PE(pos, 2i) = sin(pos / 10000^(2i/d))
+│   PE(pos, 2i+1) = cos(pos / 10000^(2i/d))
+├─ No parameters to learn
+└─ Generalizes to longer sequences
+```
+
+**하드웨어 연산 분석:**
+
+```
+Operation Type: Sequential Indexed Memory Read
+
+CPU:
+├─ Access pattern: SEQUENTIAL (0, 1, 2, ...)
+├─ Hardware prefetcher: Highly effective
+├─ Cache hit rate: ~95%
+├─ Position 0: ~2,000 cycles (cold start)
+├─ Position 1+: ~200-300 cycles (prefetched)
+├─ For L=1024: ~309K cycles = 124 μs @ 2.5 GHz
+└─ 8× faster than token embedding!
+
+GPU:
+├─ Sequential access: Perfect coalescing
+├─ Memory bandwidth: 3 MB / 900 GB/s = 3.3 μs
+├─ Same as token embedding (memory-bound)
+└─ But more cache-friendly
+
+NPU:
+├─ IDEAL for NPU: Small matrix fits in SRAM
+├─ Entire P matrix: 3.1 MB → Preload to SRAM
+├─ Sequential DMA burst read: ~5 μs
+├─ Zero DRAM access after initial load
+├─ Quantization (INT8): 0.78 MB → ~2 μs
+└─ Power: ~0.5 W
+
+Performance Comparison (L=1024):
+┌──────────┬────────────┬─────────────┬──────────┐
+│ Hardware │ Time       │ Power       │ Energy   │
+├──────────┼────────────┼─────────────┼──────────┤
+│ CPU      │ 124 μs     │ 3 W         │ 0.37 mJ  │
+│ GPU      │ 3.3 μs     │ 50 W        │ 0.17 mJ  │
+│ NPU      │ 5 μs       │ 0.5 W       │ 0.0025 mJ│
+│ NPU(INT8)│ 2 μs       │ 0.5 W       │ 0.001 mJ │
+└──────────┴────────────┴─────────────┴──────────┘
+
+Key Insight: Position embedding is hardware-friendly!
+- Sequential access (perfect for prefetching/DMA)
+- Small matrix (fits in cache/SRAM)
+- NPU is 68× more energy-efficient than GPU
+```
+
+---
+
+### 1.4 Embedding Addition
+
+**개요:** Token embedding과 Position embedding을 element-wise로 더함
+
+**입력/출력:**
+```
+Input:  token_emb [B, L, 768] + position_emb [B, L, 768]
+Output: combined_emb [B, L, 768]
+```
+
+**수학적 표현:**
+```
+h₀ = h_token + h_pos
+h₀[b, l, d] = E[x[b, l], d] + P[l, d]
+
+Operations: B × L × d additions
+          = 1 × 2 × 768 = 1,536 FP32 additions
+```
+
+**처리 과정:**
+```python
+# Token embeddings: [1, 2, 768]
+token_emb = E[token_ids]
+
+# Position embeddings: [1, 2, 768]
+position_emb = P[position_ids]
+
+# Element-wise addition
+h0 = token_emb + position_emb  # [1, 2, 768]
+
+# Example:
+# h0[0, 0] = [0.234, -0.891, ...] + [0.123, 0.456, ...]
+#          = [0.357, -0.435, ...]
+```
+
+**하드웨어 연산 분석:**
+
+```
+Operation Type: Element-wise Vector Addition (SIMD)
+
+CPU:
+├─ Scalar: 1,536 × 4 cycles = 6,144 cycles (2.5 μs)
+├─ SSE (4-wide): 384 vector ops × 4 cycles = 1,536 cycles (0.6 μs)
+├─ AVX (8-wide): 192 vector ops × 4 cycles = 768 cycles (0.3 μs)
+├─ AVX-512 (16-wide): 96 vector ops × 2 cycles = 192 cycles (0.08 μs)
+└─ Compiler auto-vectorizes (usually achieves AVX-512)
+
+GPU:
+├─ Launch 786,432 threads (one per element)
+├─ Massive parallelism: ~5 μs (includes kernel launch)
+├─ Memory coalescing: Perfect (sequential access)
+└─ Compute-bound (addition is cheap)
+
+NPU:
+├─ Vector Processing Units (VPUs)
+├─ Wide SIMD: 64-128 elements/cycle
+├─ Standalone: ~12 μs @ 1 GHz
+├─ Fused with embedding lookup: ~0 μs (FREE!)
+│  └─ Pipeline: Fetch token_emb → Fetch pos_emb → Add (overlapped)
+└─ Operation fusion eliminates memory writes
+
+Performance (B=1, L=1024):
+┌────────────┬──────────┬────────────┬──────────┐
+│ Hardware   │ Time     │ Bottleneck │ Notes    │
+├────────────┼──────────┼────────────┼──────────┤
+│ CPU(scalar)│ 1.24 ms  │ Compute    │ Slow     │
+│ CPU(AVX512)│ 39 μs    │ Memory     │ Good     │
+│ GPU        │ 5 μs     │ Launch OH  │ Fast     │
+│ NPU(fused) │ ~0 μs    │ N/A        │ FREE!    │
+└────────────┴──────────┴────────────┴──────────┘
+
+Key Optimization: Operator Fusion
+Without fusion: Embedding → Memory → Add → Memory
+With fusion:    Embedding → Add (in registers) → Next layer
+Saves 2× memory bandwidth!
+```
+
+---
+
+## 2. Transformer Blocks (×12)
+
+GPT-2 Small has 12 identical Transformer blocks. Each block processes the input through:
+1. Layer Normalization
+2. Multi-Head Self-Attention
+3. Residual Connection
+4. Layer Normalization
+5. Feed-Forward Network
+6. Residual Connection
+
+**Block Input/Output:**
+```
+Input:  h[b, l, 768] (from previous block or embedding layer)
+Output: h[b, l, 768] (to next block or final layer norm)
+```
+
+**Single Block Parameters:**
+- Layer Norm 1: 2 × 768 = 1,536
+- Attention: 4 × (768 × 768) = 2,359,296
+- Layer Norm 2: 2 × 768 = 1,536
+- MLP: 2 × 768 × 3,072 + 3,072 + 768 = 4,722,432
+- **Total per block: 7,084,800**
+- **All 12 blocks: 85,017,600 (68% of total parameters)**
+
+---
+
+### 2.1 Layer Normalization 1
+
+**개요:** 입력을 평균 0, 분산 1로 정규화 (Attention 전 적용)
+
+**입력/출력:**
+```
+Input:  h [B, L, 768]
+Output: h_norm [B, L, 768]
+```
+
+**수학적 정의:**
+```
+μ = mean(h, dim=-1)  # [B, L]
+σ² = var(h, dim=-1)   # [B, L]
+
+h_norm = γ ⊙ (h - μ) / √(σ² + ε) + β
+
+where:
+- γ (gain): [768] learnable
+- β (bias): [768] learnable
+- ε = 1e-5 (numerical stability)
+- ⊙ : element-wise multiplication
+```
+
+**처리 과정:**
+```python
+class LayerNorm(nn.Module):
+    def __init__(self, d_model=768, eps=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
+
+    def forward(self, x):
+        # x: [B, L, d_model]
+        mean = x.mean(dim=-1, keepdim=True)  # [B, L, 1]
+        var = x.var(dim=-1, keepdim=True, unbiased=False)  # [B, L, 1]
+
+        # Normalize
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)  # [B, L, d_model]
+
+        # Scale and shift
+        out = self.gamma * x_norm + self.beta  # [B, L, d_model]
+
+        return out
+```
+
+**상세 연산 (B=1, L=1024, d=768):**
+```
+Step 1: Compute mean
+  sum = Σ(h[l, d]) for d in 0..767
+  mean = sum / 768
+  Operations: 768 additions + 1 division = 769 ops per token
+  Total: 1024 × 769 = 786,176 ops
+
+Step 2: Compute variance
+  var = Σ((h[l, d] - mean)²) / 768
+  Operations: 768 subtractions + 768 multiplications + 768 additions + 1 division
+            = 2,305 ops per token
+  Total: 1024 × 2,305 = 2,360,320 ops
+
+Step 3: Normalize
+  x_norm = (h - mean) / sqrt(var + ε)
+  Operations: 768 subtractions + 1 sqrt + 768 divisions
+            = 1,537 ops per token
+  Total: 1024 × 1,537 = 1,573,888 ops
+
+Step 4: Scale and shift
+  out = gamma * x_norm + beta
+  Operations: 768 multiplications + 768 additions = 1,536 ops per token
+  Total: 1024 × 1,536 = 1,572,864 ops
+
+Total FLOPs: 786,176 + 2,360,320 + 1,573,888 + 1,572,864 ≈ 6.3M FLOPs
+```
+
+**하드웨어 연산 분석:**
+
+```
+Operation Type: Reduction + Element-wise operations
+
+CPU:
+├─ Reduction (mean, var): Sequential across d dimension
+│  └─ Cannot vectorize reduction easily
+├─ Element-wise ops: Vectorizable (AVX-512)
+├─ Cycles: ~2,000-3,000 per token
+├─ Total (L=1024): ~2-3M cycles = 1 ms @ 2.5 GHz
+└─ Bottleneck: Reduction operations
+
+GPU:
+├─ Parallel reduction: Warp-level primitives (__shfl_down)
+├─ Element-wise ops: Massively parallel
+├─ Kernel fusion: Combine all operations
+├─ Time: ~50-100 μs
+└─ Memory-bound (low arithmetic intensity)
+
+NPU:
+├─ Vector reduction units
+├─ Tree-based reduction in systolic array
+├─ Fused with attention (no intermediate write)
+├─ Time: ~30-50 μs
+└─ Power-efficient (0.2 W)
+
+Memory Bandwidth (L=1024):
+├─ Read: 1024 × 768 × 4 = 3 MB
+├─ Write: 1024 × 768 × 4 = 3 MB
+├─ Total: 6 MB
+├─ Arithmetic Intensity: 6.3M FLOPs / 6 MB = 1.05 FLOPs/byte
+└─ Memory-bound on all hardware!
+
+Optimization: Fuse with next operation (avoid write-read)
+```
+
+---
+
+### 2.2 Multi-Head Self-Attention
+
+**개요:** 시퀀스 내 모든 위치 간의 관계를 학습하는 핵심 메커니즘
+
+**입력/출력:**
+```
+Input:  h_norm [B, L, 768]
+Output: attn_out [B, L, 768]
+```
+
+**수학적 정의:**
+```
+MultiHeadAttention(X) = Concat(head₁, ..., head₁₂) @ W_o
+
+where each head:
+  Q = X @ W_q  # Query
+  K = X @ W_k  # Key
+  V = X @ W_v  # Value
+
+  head_i = Attention(Q_i, K_i, V_i)
+         = softmax(Q_i @ K_i^T / √d_k) @ V_i
+
+Parameters:
+- W_q, W_k, W_v, W_o: each [768, 768]
+- Total: 4 × 768 × 768 = 2,359,296
+```
+
+**처리 과정:**
+
+```python
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model=768, num_heads=12):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads  # 64
+
+        # Linear projections
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        # x: [B, L, d_model]
+        B, L, _ = x.shape
+
+        # 1. Linear projections
+        Q = self.W_q(x)  # [B, L, 768]
+        K = self.W_k(x)  # [B, L, 768]
+        V = self.W_v(x)  # [B, L, 768]
+
+        # 2. Reshape for multi-head
+        Q = Q.view(B, L, self.num_heads, self.d_k).transpose(1, 2)  # [B, 12, L, 64]
+        K = K.view(B, L, self.num_heads, self.d_k).transpose(1, 2)  # [B, 12, L, 64]
+        V = V.view(B, L, self.num_heads, self.d_k).transpose(1, 2)  # [B, 12, L, 64]
+
+        # 3. Scaled dot-product attention
+        scores = Q @ K.transpose(-2, -1) / (self.d_k ** 0.5)  # [B, 12, L, L]
+        attn_weights = F.softmax(scores, dim=-1)  # [B, 12, L, L]
+        attn_output = attn_weights @ V  # [B, 12, L, 64]
+
+        # 4. Concatenate heads
+        attn_output = attn_output.transpose(1, 2).contiguous()  # [B, L, 12, 64]
+        attn_output = attn_output.view(B, L, self.d_model)  # [B, L, 768]
+
+        # 5. Output projection
+        output = self.W_o(attn_output)  # [B, L, 768]
+
+        return output
+```
+
+**상세 연산 분해 (B=1, L=1024, d=768, H=12, d_k=64):**
+
+**Step 1: QKV Projections (3× Matrix Multiply)**
+```
+Q = X @ W_q  where X: [1024, 768], W_q: [768, 768]
+
+FLOPs per projection: 2 × 1024 × 768 × 768 = 1,207,959,552 (1.2B)
+Total for Q, K, V: 3 × 1.2B = 3.6B FLOPs
+
+Memory:
+├─ Read X: 1024 × 768 × 4 = 3 MB (reused 3×)
+├─ Read W_q, W_k, W_v: 3 × 768 × 768 × 4 = 7 MB
+├─ Write Q, K, V: 3 × 1024 × 768 × 4 = 9 MB
+└─ Total: 3 + 7 + 9 = 19 MB
+```
+
+**Step 2: Attention Scores (QK^T)**
+```
+Scores = Q @ K^T  where Q: [12, 1024, 64], K: [12, 1024, 64]
+Result: [12, 1024, 1024]
+
+FLOPs: 12 × 1024 × 1024 × 64 × 2 = 1,610,612,736 (1.6B)
+
+Memory (critical!):
+├─ Read Q, K: 2 × 12 × 1024 × 64 × 4 = 6 MB
+├─ Write Scores: 12 × 1024 × 1024 × 4 = 48 MB (!!)
+└─ Attention matrix is HUGE: O(L²) problem
+```
+
+**Step 3: Softmax**
+```
+For each head, each query position:
+  scores[h, i, :] → softmax → attn_weights[h, i, :]
+
+Operations per position:
+├─ exp(x_i): 1024 exp operations
+├─ sum: 1024 additions
+├─ divide: 1024 divisions
+└─ Total: ~3,072 ops per position
+
+Total: 12 heads × 1024 positions × 3,072 = 37.7M ops
+
+Memory:
+├─ Read scores: 48 MB
+├─ Write attn_weights: 48 MB
+└─ Total: 96 MB (read + write)
+```
+
+**Step 4: Attention × Value**
+```
+Output = attn_weights @ V  where attn: [12, 1024, 1024], V: [12, 1024, 64]
+Result: [12, 1024, 64]
+
+FLOPs: 12 × 1024 × 1024 × 64 × 2 = 1.6B
+
+Memory:
+├─ Read attn_weights: 48 MB
+├─ Read V: 3 MB
+├─ Write output: 3 MB
+└─ Total: 54 MB
+```
+
+**Step 5: Output Projection**
+```
+Output = concat(heads) @ W_o
+where concat: [1024, 768], W_o: [768, 768]
+
+FLOPs: 2 × 1024 × 768 × 768 = 1.2B
+
+Memory:
+├─ Read concat: 3 MB
+├─ Read W_o: 2.3 MB
+├─ Write output: 3 MB
+└─ Total: 8.3 MB
+```
+
+**Attention 총계 (B=1, L=1024):**
+```
+Total FLOPs: 3.6B + 1.6B + 0.04B + 1.6B + 1.2B = 8.04B FLOPs
+Total Memory: 19 + 54 + 96 + 54 + 8.3 = 231 MB
+
+Dominant cost:
+├─ Compute: QK^T and attn@V (1.6B each)
+├─ Memory: Attention matrix (48 MB × 2 read/write)
+└─ Bottleneck: O(L²) memory for attention matrix!
+```
+
+**하드웨어 연산 분석:**
+
+```
+CPU (Intel Xeon, 2.5 GHz):
+├─ QKV projections: ~30 ms (GEMM)
+├─ Attention scores: ~15 ms (GEMM)
+├─ Softmax: ~5 ms (reduction)
+├─ Attn × V: ~15 ms (GEMM)
+├─ Output projection: ~10 ms (GEMM)
+├─ Total: ~75 ms per attention layer
+└─ All 12 layers: ~900 ms
+
+GPU (NVIDIA A100):
+├─ QKV projections: ~100 μs (Tensor Cores, FP16)
+├─ Attention scores: ~50 μs (GEMM)
+├─ Softmax: ~20 μs (warp-level primitives)
+├─ Attn × V: ~50 μs (GEMM)
+├─ Output projection: ~30 μs (Tensor Cores)
+├─ Total: ~250 μs per layer
+├─ All 12 layers: ~3 ms
+├─ Speedup: 300× vs CPU
+└─ Memory bandwidth: 231 MB / 2 TB/s = 115 μs (memory not bottleneck)
+
+GPU Optimizations:
+├─ Tensor Cores: FP16 matmul at 312 TFLOPS
+│  └─ QKV: 3.6B FLOPs / 312 TFLOPS = 11.5 μs (theoretical)
+├─ Flash Attention: Eliminates O(L²) memory write
+│  └─ Reduces 48 MB attention matrix to tiles
+│  └─ 2-4× faster, enables longer sequences
+└─ Fused softmax: Single kernel (no intermediate write)
+
+NPU (Apple Neural Engine):
+├─ Systolic array for GEMM: Efficient
+├─ But: Attention matrix doesn't fit in SRAM (48 MB > 16 MB)
+├─ Strategy: Tile attention (compute in chunks)
+├─ QKV projections: ~500 μs (INT8)
+├─ Attention: ~2-3 ms (tiled, DRAM access)
+├─ Total per layer: ~3-4 ms
+├─ All 12 layers: ~40 ms
+└─ Trade-off: Slower than GPU, but 50× more power-efficient
+
+Flash Attention (Critical Optimization):
+┌──────────────────────────────────────────────────────┐
+│ Standard Attention:                                  │
+│ 1. Compute full S = Q @ K^T → 48 MB write to HBM    │
+│ 2. Softmax(S) → 48 MB read + 48 MB write            │
+│ 3. attn @ V → 48 MB read                            │
+│ Total HBM traffic: 192 MB                            │
+│                                                      │
+│ Flash Attention:                                     │
+│ 1. Tile Q, K, V into blocks (fit in SRAM)          │
+│ 2. Compute attention block-by-block in SRAM         │
+│ 3. Never materialize full attention matrix          │
+│ Total HBM traffic: 9 MB (Q, K, V read + output)    │
+│ Reduction: 21× less memory traffic!                 │
+└──────────────────────────────────────────────────────┘
+```
+
+**Causal Masking (GPT-2):**
+```
+GPT-2 uses causal masking (prevents attending to future tokens)
+
+Attention mask:
+┌────────────────────────┐
+│ 1  0  0  0  0  0  0  0 │  ← Token 0 can only see token 0
+│ 1  1  0  0  0  0  0  0 │  ← Token 1 can see tokens 0, 1
+│ 1  1  1  0  0  0  0  0 │
+│ 1  1  1  1  0  0  0  0 │
+│ 1  1  1  1  1  0  0  0 │
+│ 1  1  1  1  1  1  0  0 │
+│ 1  1  1  1  1  1  1  0 │
+│ 1  1  1  1  1  1  1  1 │  ← Last token can see all
+└────────────────────────┘
+
+Implementation:
+scores = Q @ K^T  # [B, H, L, L]
+scores = scores.masked_fill(mask == 0, -inf)
+attn = softmax(scores)  # Masked positions → 0 after softmax
+
+Effect on computation:
+- Still compute full O(L²) matrix
+- But effectively ~half are masked (triangular)
+- Sparse attention could optimize this (future work)
+```
+
+---
+
+### 2.3 Residual Connection 1
+
+**개요:** Attention 출력을 원래 입력에 더함 (gradient flow 개선)
+
+**입력/출력:**
+```
+Input:  h_original [B, L, 768], attn_out [B, L, 768]
+Output: h [B, L, 768]
+```
+
+**수학적 표현:**
+```
+h = h_original + attn_out
+
+Operations: B × L × d additions
+          = 1 × 1024 × 768 = 786,432 additions
+```
+
+**처리 과정:**
+```python
+# Before attention
+h_original = h.clone()  # Save input
+
+# Attention
+h_norm = layer_norm1(h)
+attn_out = attention(h_norm)
+
+# Residual connection
+h = h_original + attn_out  # Element-wise addition
+```
+
+**하드웨어 분석:**
+```
+Same as Embedding Addition (section 1.4)
+
+CPU (AVX-512): ~40 μs
+GPU: ~5 μs
+NPU (fused): ~0 μs (combined with attention output write)
+```
+
+---
+
+### 2.4 Layer Normalization 2
+
+**개요:** MLP 전에 적용되는 정규화 (Layer Norm 1과 동일)
+
+**입력/출력:**
+```
+Input:  h [B, L, 768]
+Output: h_norm [B, L, 768]
+```
+
+Same as Layer Normalization 1 (section 2.1)
+
+---
+
+### 2.5 Feed-Forward Network (MLP)
+
+**개요:** 2-layer fully connected network with GELU activation
+
+**입력/출력:**
+```
+Input:  h_norm [B, L, 768]
+Output: mlp_out [B, L, 768]
+```
+
+**수학적 정의:**
+```
+MLP(x) = W₂ @ GELU(W₁ @ x + b₁) + b₂
+
+where:
+- W₁: [768, 3072] (expansion)
+- b₁: [3072]
+- GELU: Gaussian Error Linear Unit activation
+- W₂: [3072, 768] (projection)
+- b₂: [768]
+
+Parameters: 768×3072 + 3072 + 3072×768 + 768 = 4,722,432
+```
+
+**처리 과정:**
+```python
+class MLP(nn.Module):
+    def __init__(self, d_model=768, d_ff=3072):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+        self.gelu = nn.GELU()
+
+    def forward(self, x):
+        # x: [B, L, d_model]
+
+        # Expansion
+        hidden = self.fc1(x)  # [B, L, 3072]
+
+        # GELU activation
+        hidden = self.gelu(hidden)  # [B, L, 3072]
+
+        # Projection
+        output = self.fc2(hidden)  # [B, L, d_model]
+
+        return output
+```
+
+**상세 연산 (B=1, L=1024):**
+
+**Step 1: Linear 1 (Expansion)**
+```
+hidden = X @ W₁ + b₁
+where X: [1024, 768], W₁: [768, 3072]
+
+FLOPs: 2 × 1024 × 768 × 3072 = 4,831,838,208 (4.8B)
+
+Memory:
+├─ Read X: 1024 × 768 × 4 = 3 MB
+├─ Read W₁: 768 × 3072 × 4 = 9.4 MB
+├─ Write hidden: 1024 × 3072 × 4 = 12.6 MB
+└─ Total: 25 MB
+```
+
+**Step 2: GELU Activation**
+```
+GELU(x) = x · Φ(x) = x · 0.5 · (1 + erf(x/√2))
+
+Approximation (faster):
+GELU(x) ≈ x · σ(1.702x)
+or
+GELU(x) ≈ 0.5x(1 + tanh[√(2/π)(x + 0.044715x³)])
+
+Operations per element:
+├─ Multiply: ~3-5
+├─ Add: ~2-3
+├─ Nonlinear (tanh/erf): ~10-20 (approximated)
+└─ Total: ~15-28 ops
+
+Total operations: 1024 × 3072 × 20 ≈ 63M ops
+
+Memory:
+├─ Read hidden: 12.6 MB
+├─ Write hidden: 12.6 MB (in-place possible)
+└─ Total: 25 MB
+```
+
+**Step 3: Linear 2 (Projection)**
+```
+output = hidden @ W₂ + b₂
+where hidden: [1024, 3072], W₂: [3072, 768]
+
+FLOPs: 2 × 1024 × 3072 × 768 = 4,831,838,208 (4.8B)
+
+Memory:
+├─ Read hidden: 12.6 MB
+├─ Read W₂: 3072 × 768 × 4 = 9.4 MB
+├─ Write output: 3 MB
+└─ Total: 25 MB
+```
+
+**MLP 총계:**
+```
+Total FLOPs: 4.8B + 0.06B + 4.8B = 9.66B FLOPs
+Total Memory: 25 + 25 + 25 = 75 MB
+
+Note: MLP is MORE compute than Attention!
+- MLP: 9.66B FLOPs
+- Attention: 8.04B FLOPs
+```
+
+**하드웨어 연산 분석:**
+
+```
+CPU (Intel Xeon):
+├─ FC1: ~40 ms (GEMM)
+├─ GELU: ~5 ms (element-wise)
+├─ FC2: ~40 ms (GEMM)
+├─ Total: ~85 ms per MLP layer
+└─ All 12 layers: ~1 second
+
+GPU (NVIDIA A100):
+├─ FC1: ~30 μs (Tensor Cores, FP16)
+│  └─ 4.8B FLOPs / 312 TFLOPS = 15.4 μs (theoretical)
+├─ GELU: ~10 μs (fused with FC1)
+├─ FC2: ~30 μs (Tensor Cores)
+├─ Total: ~70 μs per layer (with fusion)
+├─ All 12 layers: ~840 μs
+└─ Speedup: ~1,200× vs CPU
+
+GPU Optimizations:
+├─ Tensor Core utilization: Near 100%
+│  └─ Large matrix multiplies (ideal for Tensor Cores)
+├─ Fused FC1 + GELU: Single kernel
+│  └─ Eliminates 12.6 MB intermediate write
+├─ High arithmetic intensity:
+│  └─ 9.66B FLOPs / 75 MB = 129 FLOPs/byte
+│  └─ Compute-bound (good for GPU!)
+└─ Memory bandwidth: 75 MB / 2 TB/s = 37.5 μs
+
+NPU (Apple Neural Engine):
+├─ Systolic array ideal for GEMM
+├─ INT8 quantization:
+│  └─ Weights: 9.4 + 9.4 = 18.8 MB → 4.7 MB (4×)
+│  └─ Activations: INT8 or FP16
+├─ FC1: ~300 μs (INT8)
+├─ GELU: ~50 μs (vector ALU)
+├─ FC2: ~300 μs (INT8)
+├─ Total: ~650 μs per layer
+├─ All 12 layers: ~8 ms
+├─ Power: 0.5 W (vs 50 W GPU)
+└─ Energy: 4 mJ (vs 40 mJ GPU = 10× more efficient)
+
+Comparison:
+┌──────────┬────────────┬──────────┬──────────┬────────────┐
+│ Hardware │ Per Layer  │ 12 Layers│ Power    │ Energy     │
+├──────────┼────────────┼──────────┼──────────┼────────────┤
+│ CPU      │ 85 ms      │ 1020 ms  │ 3 W      │ 3,060 mJ   │
+│ GPU      │ 70 μs      │ 840 μs   │ 50 W     │ 42 mJ      │
+│ NPU(INT8)│ 650 μs     │ 7.8 ms   │ 0.5 W    │ 3.9 mJ     │
+└──────────┴────────────┴──────────┴──────────┴────────────┘
+```
+
+**GELU vs ReLU:**
+```
+GELU (GPT-2):
+├─ Smoother activation (differentiable everywhere)
+├─ Better gradient flow
+├─ Slightly better performance (empirically)
+└─ More expensive to compute (~20 ops vs 2 for ReLU)
+
+ReLU (older models):
+├─ Simple: max(0, x)
+├─ Fast: 2 ops (compare + conditional move)
+└─ But: Dead neurons problem
+
+Performance impact:
+- GELU adds ~5-10% compute vs ReLU
+- But training converges better
+- Worth the cost!
+```
+
+---
+
+### 2.6 Residual Connection 2
+
+**개요:** MLP 출력을 원래 입력에 더함
+
+**입력/출력:**
+```
+Input:  h_original [B, L, 768], mlp_out [B, L, 768]
+Output: h [B, L, 768]
+```
+
+**수학적 표현:**
+```
+h = h_original + mlp_out
+```
+
+Same as Residual Connection 1 (section 2.3)
+
+**Transformer Block 완료:**
+```python
+def transformer_block(x):
+    # Pre-norm architecture (GPT-2)
+
+    # Attention branch
+    h = x
+    h = layer_norm1(h)
+    h = attention(h)
+    x = x + h  # Residual 1
+
+    # MLP branch
+    h = x
+    h = layer_norm2(h)
+    h = mlp(h)
+    x = x + h  # Residual 2
+
+    return x
+```
+
+**Single Block Summary:**
+```
+Parameters: 7,084,800
+FLOPs: 8.04B (Attention) + 9.66B (MLP) = 17.7B
+Memory: 231 MB (Attention) + 75 MB (MLP) = 306 MB
+Time (GPU): 250 μs (Attn) + 70 μs (MLP) = 320 μs
+
+All 12 blocks:
+├─ Parameters: 85,017,600 (68% of model)
+├─ FLOPs: 212B (93% of total FLOPs)
+├─ Time (GPU): 3.84 ms
+└─ Dominant cost of GPT-2!
+```
+
+---
+
+## 3. Output Processing
+
+After 12 Transformer blocks, the output goes through final processing:
+
+---
+
+### 3.1 Final Layer Normalization
+
+**개요:** 마지막 Transformer block 출력 정규화
+
+**입력/출력:**
+```
+Input:  h [B, L, 768] (from last Transformer block)
+Output: h_norm [B, L, 768]
+```
+
+Same as Layer Normalization (section 2.1)
+
+```python
+h_final = layer_norm_final(h)  # [B, L, 768]
+```
+
+**Parameters:** 1,536 (γ, β)
+**FLOPs:** 6.3M
+**Time (GPU):** ~50 μs
+
+---
+
+### 3.2 Language Model Head
+
+**개요:** 768차원 벡터를 vocabulary 크기 (50,257)의 logits으로 변환
+
+**입력/출력:**
+```
+Input:  h_norm [B, L, 768]
+Output: logits [B, L, 50257]
+```
+
+**수학적 정의:**
+```
+logits = h_norm @ W_lm
+
+where:
+- W_lm: [768, 50257] (unembedding matrix)
+- W_lm = E^T (weight tying with token embedding)
+- No additional parameters!
+```
+
+**처리 과정:**
+```python
+class GPT2LMHead(nn.Module):
+    def __init__(self, d_model=768, vocab_size=50257):
+        super().__init__()
+        # Weight tying: share with token embedding
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, h):
+        # h: [B, L, d_model]
+        logits = self.lm_head(h)  # [B, L, vocab_size]
+        return logits
+```
+
+**상세 연산 (B=1, L=1024):**
+```
+logits = h @ W_lm
+where h: [1024, 768], W_lm: [768, 50257]
+
+FLOPs: 2 × 1024 × 768 × 50,257 = 78,875,893,760 (78.9B FLOPs!)
+
+Memory:
+├─ Read h: 1024 × 768 × 4 = 3 MB
+├─ Read W_lm: 768 × 50,257 × 4 = 154 MB
+├─ Write logits: 1024 × 50,257 × 4 = 206 MB
+└─ Total: 363 MB (huge!)
+
+Note: This is the LARGEST memory operation in GPT-2!
+```
+
+**Optimization: Only compute last token**
+```
+During generation (autoregressive):
+- Only need logits for last token (to predict next)
+- Input: h[-1] [1, 768]
+- Output: logits [1, 50257]
+
+FLOPs: 2 × 1 × 768 × 50,257 = 77,194,752 (77M, 1000× less!)
+
+Memory:
+├─ Read h: 768 × 4 = 3 KB
+├─ Read W_lm: 154 MB (still need full matrix)
+├─ Write logits: 50,257 × 4 = 201 KB
+└─ Total: 154 MB (mostly weight matrix)
+
+This is why generation is efficient!
+```
+
+**하드웨어 연산 분석:**
+
+```
+Full Sequence (Training, L=1024):
+
+CPU:
+├─ FLOPs: 78.9B
+├─ Time: 78.9B / (100 GFLOPS × 8 cores) = ~100 ms
+└─ Memory-bound (154 MB weight read)
+
+GPU (NVIDIA A100):
+├─ FLOPs: 78.9B / 312 TFLOPS = 253 μs (theoretical)
+├─ Memory: 363 MB / 2 TB/s = 181 μs
+├─ Actual: ~300-500 μs (memory-bound)
+└─ Bottleneck: Large vocabulary size
+
+NPU:
+├─ Challenges: 154 MB weights >> 16 MB SRAM
+├─ Must tile or keep weights in DRAM
+├─ Time: ~5-10 ms (DRAM-bound)
+└─ Not ideal for large vocabulary
+
+Single Token (Generation, L=1):
+
+CPU:
+├─ FLOPs: 77M
+├─ Time: 77M / 100 GFLOPS = 770 μs
+└─ Still memory-bound (154 MB weight)
+
+GPU:
+├─ FLOPs: 77M / 312 TFLOPS = 0.25 μs
+├─ Memory: 154 MB / 2 TB/s = 77 μs
+├─ Actual: ~100-150 μs
+└─ Memory-bound (weight matrix read)
+
+Optimization: Adaptive Softmax
+├─ Partition vocabulary into clusters
+├─ Frequent tokens: Small matrix
+├─ Rare tokens: Larger matrix (computed only if needed)
+├─ Reduces average computation by 5-10×
+└─ Used in some large language models
+```
+
+---
+
+### 3.3 Softmax & Sampling
+
+**개요:** Logits을 확률 분포로 변환하고 다음 토큰 샘플링
+
+**입력/출력:**
+```
+Input:  logits [B, vocab_size] (usually last position only)
+Output: next_token_id [B] (sampled)
+```
+
+**수학적 정의:**
+```
+Softmax:
+P(token_i) = exp(logit_i / temperature) / Σⱼ exp(logit_j / temperature)
+
+where:
+- temperature: controls randomness (default 1.0)
+  - temperature → 0: deterministic (argmax)
+  - temperature → ∞: uniform random
+
+Sampling strategies:
+1. Greedy: argmax(logits)
+2. Temperature sampling: sample from P
+3. Top-k: sample from top k tokens
+4. Top-p (nucleus): sample from smallest set with cumulative prob p
+```
+
+**처리 과정:**
+```python
+def generate_next_token(logits, temperature=1.0, top_k=50, top_p=0.9):
+    """
+    logits: [vocab_size] logits for next token
+    """
+    # Apply temperature
+    logits = logits / temperature  # [vocab_size]
+
+    # Top-k filtering
+    if top_k > 0:
+        top_k_logits, top_k_indices = torch.topk(logits, top_k)
+        logits = torch.full_like(logits, float('-inf'))
+        logits[top_k_indices] = top_k_logits
+
+    # Top-p (nucleus) filtering
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # Remove tokens with cumulative probability above threshold
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+
+        logits[sorted_indices[sorted_indices_to_remove]] = float('-inf')
+
+    # Softmax
+    probs = F.softmax(logits, dim=-1)  # [vocab_size]
+
+    # Sample
+    next_token = torch.multinomial(probs, num_samples=1)  # [1]
+
+    return next_token
+```
+
+**상세 연산:**
+
+**Step 1: Temperature Scaling**
+```
+logits = logits / temperature
+
+Operations: 50,257 divisions
+Time: ~10-20 μs (CPU), ~5 μs (GPU)
+```
+
+**Step 2: Top-k Selection**
+```
+Find top k=50 logits
+
+Algorithm: Partial sort or heap
+Operations: O(V log k) where V=50,257
+Time: ~100-200 μs (CPU), ~20 μs (GPU)
+```
+
+**Step 3: Softmax**
+```
+For k=50 tokens (after top-k):
+
+Operations:
+├─ exp(x): 50 exponentials
+├─ sum: 50 additions
+├─ divide: 50 divisions
+└─ Total: ~150 ops
+
+Time: ~1-2 μs
+```
+
+**Step 4: Multinomial Sampling**
+```
+Sample from categorical distribution
+
+Operations:
+├─ Cumulative sum: 50 additions
+├─ Random number: 1
+├─ Binary search: log₂(50) ≈ 6 comparisons
+└─ Total: ~57 ops
+
+Time: <1 μs
+```
+
+**Total Sampling Time:**
+```
+CPU: ~200 μs
+GPU: ~50 μs
+
+Note: Negligible compared to model forward pass!
+- Forward pass: 5-10 ms
+- Sampling: 0.05 ms
+- Sampling is <1% of total time
+```
+
+**Sampling Strategy Comparison:**
+
+```
+Greedy (argmax):
+├─ Output: Most likely token
+├─ Deterministic
+├─ Fast: O(V) scan
+├─ Problem: Repetitive, boring text
+└─ Use case: Deterministic tasks (code, math)
+
+Temperature Sampling:
+├─ Output: Sample from full distribution
+├─ Stochastic
+├─ Temperature control:
+│  ├─ T=0.1: Nearly deterministic, focused
+│  ├─ T=1.0: Balanced
+│  └─ T=2.0: Very random, creative
+└─ Use case: General text generation
+
+Top-k (k=50):
+├─ Output: Sample from top 50 tokens
+├─ Prevents sampling very unlikely tokens
+├─ k=1: Greedy
+├─ k=V: Full sampling
+└─ Use case: Balanced creativity
+
+Top-p (nucleus, p=0.9):
+├─ Output: Sample from smallest set with 90% probability
+├─ Adaptive: k varies by context
+├─ More robust than fixed top-k
+└─ Use case: High-quality generation (GPT-3 default)
+
+Comparison (example distribution):
+Token    Prob    Greedy  Temp   Top-k  Top-p
+"the"    0.30    ✓       30%    ✓      ✓
+"a"      0.25            25%    ✓      ✓
+"that"   0.20            20%    ✓      ✓
+"this"   0.10            10%    ✓      ✓
+"my"     0.08            8%     ✓      ✓
+...      0.07            7%     ...    ✗ (cumsum > 0.9)
+```
+
+---
+
+## 4. 전체 파이프라인 종합
+
+### 4.1 Complete Forward Pass
+
+```python
+class GPT2Small(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Input processing
+        self.token_embedding = nn.Embedding(50257, 768)
+        self.position_embedding = nn.Embedding(1024, 768)
+
+        # 12 Transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model=768, num_heads=12, d_ff=3072)
+            for _ in range(12)
+        ])
+
+        # Output processing
+        self.ln_final = LayerNorm(768)
+        self.lm_head = nn.Linear(768, 50257, bias=False)
+
+        # Weight tying
+        self.lm_head.weight = self.token_embedding.weight
+
+    def forward(self, input_ids):
+        """
+        input_ids: [B, L] token IDs
+        returns: logits [B, L, vocab_size]
+        """
+        B, L = input_ids.shape
+
+        # 1. Input processing
+        token_emb = self.token_embedding(input_ids)  # [B, L, 768]
+        position_ids = torch.arange(L, device=input_ids.device)
+        position_emb = self.position_embedding(position_ids)  # [L, 768]
+        h = token_emb + position_emb  # [B, L, 768]
+
+        # 2. Transformer blocks
+        for block in self.blocks:
+            h = block(h)  # [B, L, 768]
+
+        # 3. Output processing
+        h = self.ln_final(h)  # [B, L, 768]
+        logits = self.lm_head(h)  # [B, L, 50257]
+
+        return logits
+```
+
+### 4.2 Performance Summary
+
+**Parameters (Total: 124,439,808):**
+```
+┌──────────────────────┬─────────────┬────────────┐
+│ Component            │ Parameters  │ Percentage │
+├──────────────────────┼─────────────┼────────────┤
+│ Token Embedding      │ 38,597,376  │ 31.0%      │
+│ Position Embedding   │ 786,432     │ 0.6%       │
+│ 12× Transformer:     │             │            │
+│   - LayerNorm (×24)  │ 36,864      │ 0.03%      │
+│   - Attention (×12)  │ 28,311,552  │ 22.7%      │
+│   - MLP (×12)        │ 56,669,184  │ 45.5%      │
+│ Final LayerNorm      │ 1,536       │ 0.001%     │
+│ LM Head              │ 0 (tied)    │ 0%         │
+├──────────────────────┼─────────────┼────────────┤
+│ Total                │ 124,439,808 │ 100%       │
+└──────────────────────┴─────────────┴────────────┘
+
+Key insight: MLP dominates parameters (45.5%)
+```
+
+**FLOPs (Forward Pass, B=1, L=1024):**
+```
+┌──────────────────────┬─────────────┬────────────┐
+│ Component            │ FLOPs       │ Percentage │
+├──────────────────────┼─────────────┼────────────┤
+│ Input Embeddings     │ ~0          │ 0%         │
+│ 12× Transformer:     │             │            │
+│   - LayerNorm        │ 151M        │ 0.1%       │
+│   - Attention        │ 96.5B       │ 43.7%      │
+│   - MLP              │ 115.9B      │ 52.5%      │
+│ Final LayerNorm      │ 6.3M        │ 0.003%     │
+│ LM Head (full seq)   │ 78.9B       │ 35.7%      │
+├──────────────────────┼─────────────┼────────────┤
+│ Total (w/o LM Head)  │ 212.6B      │ 96.4%      │
+│ Total (with LM Head) │ 291.5B      │ 100%       │
+└──────────────────────┴─────────────┴────────────┘
+
+Note: During generation (single token):
+- LM Head: 77M FLOPs (1000× less)
+- Total: 212.7B FLOPs
+```
+
+**Memory (Inference, B=1, L=1024, FP32):**
+```
+Parameters:
+├─ Weights: 124M × 4 bytes = 497 MB
+└─ (FP16: 249 MB, INT8: 124 MB)
+
+Activations (peak):
+├─ Embeddings: 2 × 3 MB = 6 MB
+├─ Per Transformer block: ~25 MB
+│  └─ Attention matrix: 48 MB (dominant!)
+├─ 12 blocks (with reuse): ~80 MB
+├─ LM Head output: 206 MB
+└─ Total: ~300 MB
+
+KV Cache (for generation):
+├─ Per layer: 2 × 1024 × 768 × 4 = 6 MB
+├─ 12 layers: 72 MB
+└─ Grows linearly with sequence length
+
+Total Inference Memory:
+├─ Weights: 497 MB
+├─ Activations: 300 MB
+├─ KV Cache: 72 MB
+└─ Total: ~870 MB (~1 GB)
+```
+
+**Latency Breakdown (B=1, L=1024):**
+
+```
+CPU (Intel Xeon, 32 cores):
+┌──────────────────────┬─────────────┐
+│ Component            │ Time        │
+├──────────────────────┼─────────────┤
+│ Tokenization         │ 1 ms        │
+│ Input Embeddings     │ 1.5 ms      │
+│ 12× Transformer      │ 2,000 ms    │
+│   - LayerNorm (×24)  │ 24 ms       │
+│   - Attention (×12)  │ 900 ms      │
+│   - MLP (×12)        │ 1,020 ms    │
+│ Final LayerNorm      │ 1 ms        │
+│ LM Head (full)       │ 100 ms      │
+├──────────────────────┼─────────────┤
+│ Total                │ ~2.1 s      │
+└──────────────────────┴─────────────┘
+
+GPU (NVIDIA A100, FP16 + Tensor Cores):
+┌──────────────────────┬─────────────┐
+│ Component            │ Time        │
+├──────────────────────┼─────────────┤
+│ Tokenization (CPU)   │ 1 ms        │
+│ Input Embeddings     │ 15 μs       │
+│ 12× Transformer      │ 4 ms        │
+│   - LayerNorm (×24)  │ 1.2 ms      │
+│   - Attention (×12)  │ 1.5 ms      │
+│   - MLP (×12)        │ 0.9 ms      │
+│ Final LayerNorm      │ 50 μs       │
+│ LM Head (full)       │ 500 μs      │
+├──────────────────────┼─────────────┤
+│ Total                │ ~5.6 ms     │
+└──────────────────────┴─────────────┘
+Speedup: 375× vs CPU
+
+NPU (Apple A17, INT8):
+┌──────────────────────┬─────────────┐
+│ Component            │ Time        │
+├──────────────────────┼─────────────┤
+│ Tokenization (CPU)   │ 1 ms        │
+│ Input Embeddings     │ 50 μs       │
+│ 12× Transformer      │ 45 ms       │
+│   - Attention (×12)  │ 25 ms       │
+│   - MLP (×12)        │ 18 ms       │
+│ Final LayerNorm      │ 50 μs       │
+│ LM Head (full)       │ 8 ms        │
+├──────────────────────┼─────────────┤
+│ Total                │ ~54 ms      │
+│ Power                │ 0.8 W       │
+│ Energy               │ 43.2 mJ     │
+└──────────────────────┴─────────────┘
+GPU Energy: 280 mJ (6.5× more than NPU)
+```
+
+**Generation (Autoregressive, 100 tokens):**
+```
+GPU (with KV Cache):
+├─ First token (prompt L=1024): 5.6 ms
+├─ Token 2-100 (L=1 each): 99 × 0.3 ms = 29.7 ms
+│  └─ KV Cache eliminates re-computation
+│  └─ LM Head: 77M FLOPs (fast)
+├─ Total: 35.3 ms
+└─ Throughput: 100 tokens / 35.3 ms = 2,832 tokens/sec
+
+Without KV Cache:
+├─ Token 1 (L=1024): 5.6 ms
+├─ Token 2 (L=1025): 5.6 ms (recompute all)
+├─ Token 3 (L=1026): 5.6 ms
+├─ ...
+├─ Token 100 (L=1123): 5.6 ms
+├─ Total: 100 × 5.6 ms = 560 ms
+└─ Throughput: 100 / 560 ms = 179 tokens/sec
+
+KV Cache Speedup: 15.8× for generation!
+```
+
+### 4.3 Bottleneck Analysis
+
+```
+Memory Bottlenecks:
+┌─────────────────────┬─────────────┬───────────────┐
+│ Operation           │ Memory      │ Mitigation    │
+├─────────────────────┼─────────────┼───────────────┤
+│ Attention Matrix    │ 48 MB O(L²) │ Flash Attn    │
+│ LM Head Output      │ 206 MB      │ Compute last  │
+│ KV Cache            │ 72 MB       │ MQA/GQA       │
+│ Embedding Matrix    │ 154 MB      │ Quantization  │
+└─────────────────────┴─────────────┴───────────────┘
+
+Compute Bottlenecks:
+┌─────────────────────┬─────────────┬───────────────┐
+│ Operation           │ FLOPs       │ Mitigation    │
+├─────────────────────┼─────────────┼───────────────┤
+│ MLP                 │ 115.9B      │ Sparsity      │
+│ Attention           │ 96.5B       │ Sparse Attn   │
+│ LM Head             │ 78.9B       │ Adaptive SM   │
+└─────────────────────┴─────────────┴───────────────┘
+
+Hardware Utilization:
+┌──────────┬─────────────┬─────────────────────────┐
+│ Hardware │ Bottleneck  │ Solution                │
+├──────────┼─────────────┼─────────────────────────┤
+│ CPU      │ Compute     │ Quantization, pruning   │
+│ GPU      │ Memory BW   │ Fusion, Flash Attention │
+│ NPU      │ SRAM size   │ Tiling, quantization    │
+└──────────┴─────────────┴─────────────────────────┘
+```
+
+### 4.4 최적화 전략 요약
+
+```
+Training:
+├─ Mixed Precision (FP16): 2× speedup
+├─ Gradient Checkpointing: 3× memory reduction
+├─ Distributed Training: Near-linear scaling
+└─ Flash Attention: 2-4× faster, enables longer sequences
+
+Inference:
+├─ KV Cache: 15× speedup for generation
+├─ Quantization (INT8): 4× less memory, 2-4× faster
+├─ Flash Attention: 2-4× faster
+├─ Operator Fusion: 20-30% speedup
+├─ Batch Processing: Amortize fixed costs
+└─ Sparse Attention: For very long sequences
+
+Mobile/Edge:
+├─ INT8 Quantization: Mandatory
+├─ Pruning: 30-50% reduction with minimal loss
+├─ Distillation: Smaller student model
+└─ NPU Acceleration: 10× energy efficiency
+```
+
+---
+
+## 5. End-to-End Example
+
+**Input:** "Hello world"
+**Task:** Generate next token
+
+```
+Step-by-step execution:
+
+1. Tokenization (CPU):
+   "Hello world" → [15496, 995]
+   Time: ~2 μs
+
+2. Input Processing (GPU):
+   - Token Embedding: [15496, 995] → [2, 768]
+   - Position Embedding: [0, 1] → [2, 768]
+   - Addition: → [2, 768]
+   Time: ~20 μs
+
+3. Transformer Block 1:
+   - LayerNorm: [2, 768] → [2, 768]
+   - Attention: [2, 768] → [2, 768]
+   - Residual: [2, 768] + [2, 768] → [2, 768]
+   - LayerNorm: [2, 768] → [2, 768]
+   - MLP: [2, 768] → [2, 768]
+   - Residual: [2, 768] + [2, 768] → [2, 768]
+   Time: ~300 μs
+
+4. Transformer Blocks 2-12:
+   Same as above
+   Time: 11 × 300 μs = 3.3 ms
+
+5. Final LayerNorm:
+   [2, 768] → [2, 768]
+   Time: ~50 μs
+
+6. LM Head (last token only):
+   [1, 768] → [1, 50257]
+   Time: ~150 μs
+
+7. Softmax + Sampling (CPU/GPU):
+   [50257] → token_id (e.g., 318 for ",")
+   Time: ~50 μs
+
+Total: ~4 ms on GPU A100
+Output: Token 318 (",")
+Next input: "Hello world,"
+```
+
+---
+
+## Conclusion
+
+GPT-2 Small은 간단해 보이지만 복잡한 연산 파이프라인을 가지고 있습니다:
+
+**핵심 특징:**
+- **124M parameters**: 68% in MLPs, 23% in Attention
+- **212B FLOPs**: MLP (53%), Attention (44%)
+- **O(L²) complexity**: Attention matrix is bottleneck
+- **Inference: 5-50 ms**: Depending on hardware (GPU vs NPU vs CPU)
+
+**하드웨어 최적화의 중요성:**
+- GPU: 375× faster than CPU (with Tensor Cores)
+- NPU: 6× more energy-efficient than GPU
+- KV Cache: 15× speedup for generation
+- Flash Attention: 2-4× faster, enables 8K+ contexts
+
+**Future Directions:**
+- Longer contexts (Flash Attention, sparse attention)
+- Efficiency (quantization, pruning, distillation)
+- Specialized hardware (Groq LPU, Cerebras, TPU v5)
