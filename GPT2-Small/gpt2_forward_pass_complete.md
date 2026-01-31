@@ -21,6 +21,28 @@
 
 ---
 
+## 표기법 (Notation)
+
+본 문서에서 사용하는 변수 정의:
+
+| 변수 | 의미 | GPT-2 Small 값 |
+|------|------|----------------|
+| **B** | Batch size (동시 처리하는 시퀀스 수) | 예시에서 1 |
+| **L** | Sequence length (토큰 개수) | 최대 1024 |
+| **V** | Vocabulary size (어휘 크기) | 50,257 |
+| **d** 또는 **d_model** | Hidden dimension (은닉층 차원) | 768 |
+| **H** 또는 **num_heads** | Number of attention heads (어텐션 헤드 수) | 12 |
+| **d_k** | Head dimension (헤드당 차원) = d / H | 64 |
+| **d_ff** | FFN hidden dimension (MLP 중간층 차원) | 3,072 (= 4 × d) |
+| **N** | Number of layers (레이어 수) | 12 |
+
+**Shape 표기 규칙:**
+- `[B, L]` → Batch × Sequence length (2D 텐서)
+- `[B, L, d]` → Batch × Sequence × Hidden (3D 텐서)
+- `[B, H, L, L]` → Batch × Heads × Query positions × Key positions
+
+---
+
 ## 모델 개요
 
 ```
