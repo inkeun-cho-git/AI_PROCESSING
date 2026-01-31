@@ -47,6 +47,28 @@ Total Operations:
 - ALU Operations: ~11 MOV/COPY (for ASCII)
 - Memory Writes: 11 bytes to output buffer
 - Estimated Cycles: ~50-100 cycles (cache-dependent)
+
+GPU Implementation:
+├─ Generally NOT executed on GPU
+│  ├─ Tokenization preprocessing stays on CPU
+│  ├─ String operations not GPU-friendly
+│  └─ Data transfer overhead >> computation time
+│
+└─ If forced to GPU (academic exercise):
+   ├─ Launch 11 threads (one per character)
+   ├─ Each thread: read byte, check range, copy/encode
+   ├─ Execution: ~10-20 μs (kernel launch overhead dominates)
+   └─ No practical benefit (1000× slower than CPU!)
+
+NPU Implementation:
+├─ NOT suitable for NPU execution
+│  ├─ NPU designed for matrix/tensor operations
+│  ├─ String encoding is control-flow heavy
+│  ├─ No MAC (multiply-accumulate) operations
+│  └─ NPU has no advantage over CPU here
+│
+└─ Practical approach:
+   └─ Always execute on CPU, transfer results to NPU/GPU later
 ```
 
 #### Step 2: 바이트를 초기 토큰으로 변환
@@ -93,6 +115,32 @@ Optimization Notes:
 - LUT은 작아서 L1 캐시에 완전히 fit됨 (캐시 미스 없음)
 - Sequential processing (no SIMD, character-by-character)
 - Branch-free operation (직접 인덱싱)
+
+GPU Implementation:
+├─ Minimal benefit for GPU execution
+│  ├─ Can launch 11 threads for 11 bytes
+│  ├─ Each thread: index into LUT, retrieve unicode char
+│  ├─ LUT stored in constant memory (cached, fast access)
+│  └─ Execution: ~5-10 μs (kernel launch overhead)
+│
+├─ Performance:
+│  ├─ Actual computation: <0.1 μs
+│  ├─ Kernel launch: ~5 μs
+│  ├─ Memory copy (CPU→GPU): ~10 μs (even for 11 bytes!)
+│  └─ Total: ~15 μs vs ~0.05 μs CPU = 300× SLOWER
+│
+└─ Conclusion: Not worth GPU transfer overhead
+
+NPU Implementation:
+├─ Completely unsuitable for NPU
+│  ├─ NPU lacks general-purpose lookup operations
+│  ├─ Designed for dense matrix multiplications
+│  ├─ No advantage over CPU for table lookups
+│  └─ Would require CPU emulation layer
+│
+└─ Best practice:
+   ├─ Keep on CPU (ultra-fast already)
+   └─ Only transfer final token IDs to NPU
 ```
 
 #### Step 3: BPE Merge 규칙 적용
@@ -190,6 +238,59 @@ Estimated Total for "Hello world":
 - Cycles: ~5,000-10,000 cycles (cache-dependent)
 - Memory Bandwidth: ~2-4 KB
 - Dominant Cost: Random memory access for merge rule lookups
+
+GPU Implementation:
+├─ HIGHLY INEFFICIENT for BPE
+│  ├─ BPE is inherently sequential (each merge depends on previous)
+│  ├─ Cannot parallelize within a single sequence
+│  ├─ String manipulation is not GPU-friendly
+│  └─ GPU threads would sit idle waiting for dependencies
+│
+├─ Possible GPU Parallelization:
+│  ├─ Batch-level: Tokenize multiple sentences in parallel
+│  │  └─ Launch one thread block per sentence
+│  ├─ Each block runs BPE sequentially
+│  └─ Speedup: ~2-5× (for large batches, B > 100)
+│
+├─ Performance Reality:
+│  ├─ Single sequence: GPU slower than CPU (overhead)
+│  ├─ Small batch (B < 32): Still slower (transfer cost)
+│  ├─ Large batch (B > 100): Marginal benefit
+│  └─ Kernel launch + transfer: ~20-50 μs baseline cost
+│
+└─ Industry Practice:
+   └─ ALWAYS perform BPE tokenization on CPU
+   └─ Only transfer final token IDs to GPU
+
+NPU Implementation:
+├─ COMPLETELY UNSUITABLE
+│  ├─ NPU designed for fixed computation graphs
+│  ├─ BPE requires dynamic control flow (while loops, conditionals)
+│  ├─ String operations not supported in NPU instruction set
+│  ├─ No hash table or dynamic memory allocation
+│  └─ Would require full CPU emulation
+│
+├─ Why NPU Cannot Handle BPE:
+│  ├─ NPU architecture: Systolic arrays for matrix ops
+│  │  └─ Fixed dataflow, no branching
+│  ├─ BPE needs: Hash lookups, string concat, array reordering
+│  │  └─ All impossible on pure NPU hardware
+│  └─ NPU lacks general-purpose ALU for string operations
+│
+└─ Practical Reality:
+   ├─ BPE must execute on CPU
+   ├─ NPU only activates after embedding lookup
+   └─ Token IDs transferred from CPU → NPU memory
+
+Performance Comparison (B=1, "Hello world"):
+┌────────────────┬──────────────┬─────────────────────────────┐
+│ Hardware       │ Time         │ Notes                       │
+├────────────────┼──────────────┼─────────────────────────────┤
+│ CPU (single)   │ ~2-4 μs      │ Optimal for single sequence │
+│ GPU (single)   │ ~50-100 μs   │ 20× SLOWER (overhead)       │
+│ GPU (batch 100)│ ~200 μs      │ ~2× faster (batch parallel) │
+│ NPU            │ Not possible │ Requires CPU preprocessing  │
+└────────────────┴──────────────┴─────────────────────────────┘
 ```
 
 #### Step 4: 토큰을 ID로 변환
@@ -256,6 +357,45 @@ Optimization Opportunities:
 - Perfect hashing (no collisions) → reduce cycles by ~30%
 - Token ID caching (for repeated lookups) → near-zero cost
 - Batch processing: Minimal benefit (independent lookups)
+
+GPU Implementation:
+├─ Limited benefit (still CPU-bound)
+│  ├─ Hash table lookups can be parallelized
+│  ├─ Launch one thread per token
+│  └─ Each thread: hash string → lookup vocab → return ID
+│
+├─ GPU Challenges:
+│  ├─ String hashing on GPU is slower than CPU
+│  │  └─ Character-by-character processing not parallel
+│  ├─ Hash table in GPU memory (global memory)
+│  │  └─ Random access pattern → poor memory coalescing
+│  ├─ Collision handling requires divergent branches
+│  │  └─ Warp efficiency drops significantly
+│  └─ Small workload doesn't saturate GPU
+│
+├─ Performance (2 tokens):
+│  ├─ Kernel launch: ~5 μs
+│  ├─ Hash + lookup: ~0.5 μs (2 threads, trivial work)
+│  ├─ Memory transfer: ~10 μs (CPU↔GPU)
+│  └─ Total: ~15 μs vs ~0.12 μs CPU = 125× SLOWER
+│
+└─ Batch Performance (1024 tokens):
+   ├─ Parallel hash lookups: ~2 μs (all simultaneous)
+   ├─ Transfer overhead: ~20 μs
+   └─ Total: ~22 μs vs ~60 μs CPU = marginal benefit
+
+NPU Implementation:
+├─ NOT APPLICABLE
+│  ├─ Hash table lookup not supported on NPU
+│  ├─ String operations require general-purpose CPU
+│  ├─ NPU vocabulary stored differently (embedding matrix)
+│  └─ This step stays on CPU entirely
+│
+└─ Alternative: Embedding Lookup on NPU
+   ├─ Skip vocabulary hash lookup on NPU
+   ├─ CPU generates token IDs (integers)
+   ├─ NPU starts from token IDs → embedding lookup
+   └─ See Token Embedding section for NPU details
 ```
 
 ### 1.3 실제 구현 의사코드
@@ -596,6 +736,92 @@ Token 2: E[262]   → Read row 262   (3 KB, random location)
 ...
 → Random strided access (poor cache locality across tokens)
 → Good cache locality within each embedding (contiguous 768 floats)
+
+NPU Implementation:
+├─ NPU Architecture Overview
+│  ├─ Systolic array for matrix operations
+│  ├─ Processing-in-Memory (PIM) capabilities
+│  ├─ Optimized for INT8/INT16 quantized operations
+│  └─ Much lower power consumption than GPU
+│
+├─ Embedding Lookup on NPU
+│  ├─ Similar to GPU: Indexed memory read operation
+│  ├─ NOT a matrix multiplication (no MAC operations used)
+│  ├─ Utilizes DMA engines for memory transfer
+│  │  └─ Token IDs → Memory addresses → Embedding vectors
+│  └─ Parallel lookup using multiple DMA channels
+│
+├─ NPU-Specific Optimizations
+│  ├─ Quantization (FP32 → INT8/INT16)
+│  │  ├─ Embedding matrix: 154 MB → 38-77 MB (2-4× reduction)
+│  │  ├─ Faster memory transfer (fits better in on-chip SRAM)
+│  │  └─ Trade-off: Slight accuracy loss (~0.5% perplexity increase)
+│  │
+│  ├─ On-Chip Embedding Cache
+│  │  ├─ NPUs often have large SRAM (e.g., 8-16 MB on Apple Neural Engine)
+│  │  ├─ Cache top-K frequent tokens (K=2000-5000)
+│  │  │  └─ Covers ~90% of actual token usage (Zipf distribution)
+│  │  ├─ Cache hit: ~10-20 cycles (SRAM access)
+│  │  ├─ Cache miss: ~500-1000 cycles (DRAM access)
+│  │  └─ Effective speedup: ~3-5× vs full DRAM lookup
+│  │
+│  └─ Batch Processing
+│     ├─ Process entire batch of token IDs simultaneously
+│     ├─ Multiple DMA channels fetch embeddings in parallel
+│     └─ Hide memory latency with computation overlap
+│
+├─ Performance Characteristics (Apple A17 Neural Engine example)
+│  ├─ Single token lookup: ~50-100 ns (SRAM cache hit)
+│  ├─ Batch 1024 tokens (uncached): ~30-50 μs
+│  │  └─ Parallel memory fetch across 16 DMA channels
+│  ├─ Power consumption: ~0.5-1 W (vs ~50-100 W GPU)
+│  └─ Energy efficiency: 10-20× better than GPU
+│
+├─ Comparison with GPU (A100):
+│  ┌──────────────────────┬─────────────┬──────────────┬──────────────┐
+│  │ Metric               │ GPU (A100)  │ NPU (A17)    │ Advantage    │
+│  ├──────────────────────┼─────────────┼──────────────┼──────────────┤
+│  │ Latency (1024 tokens)│ 3.3 μs      │ 30 μs        │ GPU 9× faster│
+│  │ Throughput (large B) │ 900 GB/s    │ 50-100 GB/s  │ GPU 9-18×    │
+│  │ Power Consumption    │ 50-100 W    │ 0.5-1 W      │ NPU 100× less│
+│  │ Energy per Inference │ ~0.17 mJ    │ ~0.03 mJ     │ NPU 6× better│
+│  │ Matrix Size Support  │ Unlimited   │ Limited SRAM │ GPU better   │
+│  └──────────────────────┴─────────────┴──────────────┴──────────────┘
+│
+└─ NPU Best Use Cases
+   ├─ Mobile/Edge devices (battery-powered)
+   ├─ Always-on inference (e.g., voice assistants)
+   ├─ Small to medium batches (B=1-16)
+   ├─ Quantized models (INT8/INT16 preferred)
+   └─ When power efficiency > raw speed
+
+Real-World NPU Examples:
+├─ Apple Neural Engine (A14-A18, M1-M4)
+│  ├─ 16-core design, ~35 TOPS (INT8)
+│  ├─ Large on-chip SRAM for embedding cache
+│  └─ Token embedding: ~20-40 μs (batch 512)
+│
+├─ Google Tensor TPU (Edge TPU)
+│  ├─ 4-8 TOPS, optimized for MobileNet/BERT
+│  ├─ INT8 quantization required
+│  └─ Embedding lookup: ~50-80 μs (batch 512)
+│
+├─ Qualcomm Hexagon NPU (Snapdragon 8 Gen 3)
+│  ├─ 12 TOPS, INT8/INT16 focus
+│  ├─ Shared memory architecture
+│  └─ Embedding lookup: ~30-60 μs (batch 512)
+│
+└─ Samsung NPU (Exynos 2400)
+   ├─ 17 TOPS, INT8 optimized
+   └─ Token embedding: ~25-50 μs (batch 512)
+
+Key Insight:
+├─ Embedding lookup is MEMORY-BOUND, not COMPUTE-BOUND
+├─ NPU advantage comes from:
+│  ├─ Lower memory latency (on-chip SRAM)
+│  ├─ Better power efficiency
+│  └─ Quantization support
+└─ GPU wins on raw throughput, NPU wins on efficiency
 ```
 
 ---
@@ -863,6 +1089,102 @@ Position 2: P[2]   → Read row 2   (3 KB, next row) ← Prefetched
 → Sequential strided access (excellent cache locality)
 → Predictable pattern → hardware prefetch highly effective
 → Streaming memory access (optimal DRAM efficiency)
+
+NPU Implementation:
+├─ IDEAL for NPU Execution
+│  ├─ Position matrix is small (3.1 MB)
+│  ├─ Sequential access pattern (perfect for DMA streaming)
+│  ├─ Highly predictable memory access
+│  └─ Can fit entirely in NPU on-chip SRAM
+│
+├─ NPU Optimizations
+│  ├─ Entire Position Matrix in SRAM
+│  │  ├─ Many NPUs have 8-16 MB SRAM
+│  │  ├─ Position matrix: 3.1 MB (FP32) or 0.78 MB (INT8)
+│  │  ├─ Load once at model initialization
+│  │  └─ Zero-latency access during inference
+│  │
+│  ├─ DMA Streaming Read
+│  │  ├─ Sequential position IDs (0, 1, 2, ..., seq_len-1)
+│  │  ├─ Burst read from SRAM (optimal bandwidth)
+│  │  ├─ No cache misses (all data in SRAM)
+│  │  └─ Perfect prefetching from sequential pattern
+│  │
+│  └─ Quantization Benefits
+│     ├─ FP32 → INT8: 4× smaller (3.1 MB → 0.78 MB)
+│     ├─ Entire matrix easily fits in small NPU SRAM
+│     ├─ 4× faster memory transfer
+│     └─ Minimal accuracy loss (position info is robust)
+│
+├─ Performance (Apple A17 Neural Engine example)
+│  ├─ Position matrix: Preloaded in SRAM (one-time cost)
+│  ├─ Sequential lookup (seq_len=1024):
+│  │  ├─ SRAM burst read: ~5-10 μs
+│  │  ├─ No DRAM access needed
+│  │  └─ Fully pipelined with token embedding
+│  │
+│  └─ Latency breakdown:
+│     ├─ Address generation: ~100 ns (sequential, trivial)
+│     ├─ SRAM read (1024 positions): ~5 μs (burst mode)
+│     ├─ No stalls, no cache misses
+│     └─ Total: ~5 μs (vs 124 μs CPU, 3.3 μs GPU)
+│
+├─ Comparison Across Hardware:
+│  ┌────────────────┬──────────────┬─────────────────────────────┐
+│  │ Hardware       │ Time (1024)  │ Key Advantage               │
+│  ├────────────────┼──────────────┼─────────────────────────────┤
+│  │ CPU            │ 124 μs       │ Prefetch helps, DRAM-bound  │
+│  │ GPU (A100)     │ 3.3 μs       │ High bandwidth, parallel    │
+│  │ NPU (A17)      │ ~5 μs        │ SRAM cached, power-efficient│
+│  │ NPU (quantized)│ ~2 μs        │ INT8, 4× less data          │
+│  └────────────────┴──────────────┴─────────────────────────────┘
+│
+└─ Power Efficiency:
+   ├─ CPU: ~3 W for 124 μs = ~0.37 mJ
+   ├─ GPU: ~50 W for 3.3 μs = ~0.17 mJ
+   ├─ NPU: ~0.5 W for 5 μs = ~0.0025 mJ
+   └─ NPU is 68× more energy-efficient than GPU!
+
+NPU Best Practices for Position Embedding:
+├─ Preload Strategy
+│  ├─ Load position matrix to SRAM at model init
+│  ├─ Keep in SRAM across all inferences
+│  └─ Only reload if model changes
+│
+├─ Quantization Strategy
+│  ├─ Use INT8 or INT16 for position embeddings
+│  ├─ Minimal impact on final model accuracy
+│  ├─ 4-2× memory savings
+│  └─ Faster data movement
+│
+└─ Memory Layout
+   ├─ Store positions contiguously in SRAM
+   ├─ Align to DMA burst size (e.g., 64 bytes)
+   └─ Enable sequential burst reads
+
+Real-World NPU Performance:
+├─ Apple Neural Engine (A17/M4)
+│  ├─ Position matrix: Fully cached in 16 MB SRAM
+│  ├─ Lookup 512 positions: ~2-3 μs
+│  └─ Power: ~0.001 mJ
+│
+├─ Google Edge TPU
+│  ├─ Position matrix: 8 MB SRAM (INT8 quantized)
+│  ├─ Lookup 512 positions: ~4-6 μs
+│  └─ Optimized for sequential DMA
+│
+└─ Qualcomm Hexagon NPU
+   ├─ Hybrid SRAM/DRAM approach
+   ├─ Frequent positions in SRAM (first 256)
+   └─ Lookup 512 positions: ~6-10 μs
+
+Key Insight:
+├─ Position embedding is NPU-FRIENDLY
+│  ├─ Small matrix size (fits in SRAM)
+│  ├─ Sequential access (perfect for DMA)
+│  └─ Predictable pattern (no cache thrashing)
+├─ Much better than token embedding for NPU
+└─ NPU beats CPU on power, competitive with GPU on speed
 ```
 
 ---
@@ -1145,6 +1467,142 @@ Key Insights:
    ├─ Modern compilers auto-vectorize this
    ├─ PyTorch/NumPy use optimized BLAS libraries
    └─ Typically achieves near-peak throughput
+
+NPU Implementation:
+├─ PERFECT for NPU Execution
+│  ├─ Element-wise addition is core NPU operation
+│  ├─ NPU has dedicated vector ALUs for this
+│  ├─ Can fuse with other operations (activation functions)
+│  └─ Zero overhead when pipelined with other ops
+│
+├─ NPU Architecture for Vector Addition
+│  ├─ Systolic Array Bypass Mode
+│  │  ├─ Matrix ops use systolic array (MAC units)
+│  │  ├─ Vector ops use dedicated vector units
+│  │  └─ Addition doesn't need MACs
+│  │
+│  ├─ Vector Processing Units (VPUs)
+│  │  ├─ Separate ALUs for element-wise ops
+│  │  ├─ Wide SIMD: 32-128 elements in parallel
+│  │  ├─ 1 cycle throughput per vector operation
+│  │  └─ Pipelined with memory operations
+│  │
+│  └─ Operation Fusion
+│     ├─ Combine embedding lookup + addition + activation
+│     ├─ No intermediate memory writes
+│     ├─ Data stays in on-chip registers
+│     └─ Massive latency reduction
+│
+├─ NPU Performance (B=1, L=1024, d=768)
+│  ├─ Standalone Addition (if executed separately):
+│  │  ├─ Vector width: 64 floats (typical NPU)
+│  │  ├─ Total vectors: 786,432 / 64 = 12,288
+│  │  ├─ Cycles: ~12,288 cycles @ 1 cycle/vector
+│  │  ├─ Time: ~12 μs @ 1 GHz NPU clock
+│  │  └─ Power: ~0.2 W
+│  │
+│  ├─ Fused Operation (typical real-world case):
+│  │  ├─ Combine: Token embed lookup + Pos embed + Add
+│  │  ├─ Pipeline stages:
+│  │  │  └─ Stage 1: DMA fetch token embedding
+│  │  │  └─ Stage 2: DMA fetch position embedding
+│  │  │  └─ Stage 3: Vector add (while fetching next)
+│  │  ├─ Addition fully hidden in memory latency
+│  │  ├─ Effective addition time: ~0 μs (free!)
+│  │  └─ Total time dominated by memory fetch
+│  │
+│  └─ Quantized Mode (INT8):
+│     ├─ INT8 addition: Even faster than FP32
+│     ├─ Wider SIMD: 128-256 INT8 elements/cycle
+│     ├─ Time: ~3-5 μs (standalone)
+│     └─ Fused: Still essentially free
+│
+├─ NPU Optimization Techniques
+│  ├─ Operator Fusion
+│  │  ├─ Fuse: Embed_Lookup → Add → LayerNorm
+│  │  ├─ Compiler automatically fuses operations
+│  │  ├─ Reduces memory traffic by 2-3×
+│  │  └─ Example: CoreML, TensorFlow Lite, ONNX Runtime
+│  │
+│  ├─ In-Register Computation
+│  │  ├─ Embeddings loaded to vector registers
+│  │  ├─ Addition happens in registers (no SRAM write)
+│  │  ├─ Result directly fed to next layer
+│  │  └─ Zero memory bandwidth for addition
+│  │
+│  └─ Precision Management
+│     ├─ FP32 embeddings → INT8 addition → FP32 output
+│     ├─ Mixed precision for speed + accuracy
+│     └─ NPU hardware supports all common formats
+│
+├─ Real-World NPU Performance
+│  ├─ Apple Neural Engine (A17)
+│  │  ├─ Vector units: 128-wide INT8, 64-wide FP16
+│  │  ├─ Addition (fused): ~0 μs (hidden in pipeline)
+│  │  ├─ Addition (standalone): ~3-5 μs (rarely done)
+│  │  └─ Power for addition: ~0.0001 mJ (negligible)
+│  │
+│  ├─ Google Edge TPU
+│  │  ├─ Systolic array: 64×64 for matmul
+│  │  ├─ Vector ALU: Separate 128-wide unit
+│  │  ├─ Addition: ~5-8 μs (standalone, INT8)
+│  │  └─ Usually fused with quantization step
+│  │
+│  └─ Qualcomm Hexagon NPU
+│     ├─ HVX vector units: 128-byte SIMD
+│     ├─ Addition: ~4-6 μs (standalone)
+│     └─ Fusion engine combines up to 4 ops
+│
+├─ Performance Comparison (B=1, L=1024):
+│  ┌──────────────────┬──────────────┬─────────────┬──────────────┐
+│  │ Hardware         │ Time         │ Power       │ Energy       │
+│  ├──────────────────┼──────────────┼─────────────┼──────────────┤
+│  │ CPU (scalar)     │ 1.24 ms      │ 3 W         │ 3.72 mJ      │
+│  │ CPU (AVX-512)    │ 39 μs        │ 3 W         │ 0.12 mJ      │
+│  │ GPU (A100)       │ 5 μs         │ 50 W        │ 0.25 mJ      │
+│  │ NPU (standalone) │ 12 μs        │ 0.2 W       │ 0.0024 mJ    │
+│  │ NPU (fused)      │ ~0 μs        │ 0 W         │ ~0 mJ        │
+│  └──────────────────┴──────────────┴─────────────┴──────────────┘
+│
+└─ Key Takeaway:
+   ├─ Addition is trivial on NPU (almost free when fused)
+   ├─ NPU shines through operator fusion
+   ├─ Energy efficiency: 100-1000× better than CPU/GPU
+   └─ Best for mobile/edge inference
+
+NPU Operator Fusion Example:
+```
+Without Fusion (3 separate operations):
+1. Token_Embed: Token_IDs → DRAM read → SRAM → Registers (~30 μs)
+2. Pos_Embed: Pos_IDs → SRAM read → Registers (~5 μs)
+3. Add: Registers → Vector ALU → SRAM write (~12 μs)
+Total: ~47 μs, multiple memory round-trips
+
+With Fusion (single fused op):
+1. Fused_Embed_Add:
+   ├─ Token_IDs → DRAM read → Registers
+   ├─ Pos_IDs → SRAM read → Registers
+   ├─ Vector Add in registers (overlapped with fetch)
+   └─ Result → Next layer (no SRAM write)
+Total: ~30 μs, single memory round-trip
+Speedup: 1.6×, Energy savings: 2-3×
+```
+
+Why NPU Excels at Vector Addition:
+├─ Hardware Support
+│  ├─ Dedicated wide SIMD vector units
+│  ├─ Single-cycle throughput for common ops
+│  └─ Parallel execution with memory ops
+│
+├─ Compiler Optimization
+│  ├─ Automatic operator fusion
+│  ├─ Eliminates intermediate memory traffic
+│  └─ Optimizes entire computation graph
+│
+└─ Energy Efficiency
+   ├─ Low-power vector ALUs (~0.1-0.5 W)
+   ├─ On-chip SRAM (no DRAM power)
+   └─ Operation fusion reduces data movement
 ```
 
 ---
@@ -1397,3 +1855,302 @@ Recommendation by Use Case:
 - Output layer: ~5%
 
 → 입력 처리 최적화는 중요하지만, Transformer block이 주요 타겟!
+
+---
+
+## CPU vs GPU vs NPU 아키텍처 종합 비교
+
+### 하드웨어 아키텍처 근본적 차이
+
+```
+CPU (Central Processing Unit):
+┌─────────────────────────────────────────────────────────┐
+│ Design Philosophy: General-purpose, Low-latency         │
+├─────────────────────────────────────────────────────────┤
+│ Core Architecture:                                      │
+│ ├─ 4-32 cores (high-end: up to 128)                    │
+│ ├─ Complex out-of-order execution                      │
+│ ├─ Branch prediction, speculative execution            │
+│ ├─ Large caches (32 MB - 256 MB total)                 │
+│ └─ High clock speed (2-5 GHz)                          │
+│                                                         │
+│ Compute Units:                                          │
+│ ├─ Scalar ALUs + Vector units (AVX-512)               │
+│ ├─ ~16 FP32 ops per cycle per core (AVX-512)          │
+│ ├─ Peak: ~1-3 TFLOPS (FP32)                           │
+│ └─ Optimized for serial/branching code                 │
+│                                                         │
+│ Memory:                                                 │
+│ ├─ L1: 32-64 KB/core, L2: 256KB-1MB/core              │
+│ ├─ L3: 8-256 MB shared                                │
+│ ├─ DRAM: 16-128 GB DDR4/DDR5                          │
+│ └─ Bandwidth: 50-100 GB/s                             │
+│                                                         │
+│ Power: 15-280 W (desktop/server)                       │
+└─────────────────────────────────────────────────────────┘
+
+GPU (Graphics Processing Unit):
+┌─────────────────────────────────────────────────────────┐
+│ Design Philosophy: Massive parallelism, High throughput │
+├─────────────────────────────────────────────────────────┤
+│ Core Architecture:                                      │
+│ ├─ 2,000-16,000+ CUDA cores (NVIDIA A100: 6,912)      │
+│ ├─ Organized in SMs (Streaming Multiprocessors)       │
+│ ├─ SIMT execution model (warp-based)                  │
+│ ├─ Limited cache per SM                               │
+│ └─ Lower clock speed (1-2 GHz)                        │
+│                                                         │
+│ Compute Units:                                          │
+│ ├─ Thousands of simple FP32/FP16 ALUs                 │
+│ ├─ Tensor Cores for matrix operations (A100: 312)     │
+│ ├─ Peak: 19.5 TFLOPS (FP32), 312 TFLOPS (FP16 Tensor)│
+│ └─ Optimized for data-parallel operations              │
+│                                                         │
+│ Memory:                                                 │
+│ ├─ Registers: 256 KB/SM                               │
+│ ├─ Shared Memory: 164 KB/SM (A100)                    │
+│ ├─ L2 Cache: 40 MB (A100)                             │
+│ ├─ HBM2/HBM2e: 40-80 GB                               │
+│ └─ Bandwidth: 900 GB/s - 2 TB/s (A100)               │
+│                                                         │
+│ Power: 50-400 W (datacenter GPUs)                      │
+└─────────────────────────────────────────────────────────┘
+
+NPU (Neural Processing Unit / AI Accelerator):
+┌─────────────────────────────────────────────────────────┐
+│ Design Philosophy: Energy-efficient AI, Fixed workloads │
+├─────────────────────────────────────────────────────────┤
+│ Core Architecture:                                      │
+│ ├─ Systolic array (8×8 to 128×128 MACs)               │
+│ ├─ Fixed dataflow, no branching                       │
+│ ├─ Processing-in-Memory (PIM) design                  │
+│ ├─ Specialized for matrix multiply-accumulate         │
+│ └─ Low clock speed (0.5-1.5 GHz)                      │
+│                                                         │
+│ Compute Units:                                          │
+│ ├─ MAC arrays (Apple A17: ~35 TOPS INT8)              │
+│ ├─ Quantization support (INT8/INT16 native)           │
+│ ├─ Peak: 10-50 TOPS (INT8), 2-10 TFLOPS (FP16)       │
+│ └─ Optimized ONLY for neural net operations           │
+│                                                         │
+│ Memory:                                                 │
+│ ├─ Large on-chip SRAM: 4-16 MB                        │
+│ ├─ Shared with CPU system memory (unified)            │
+│ ├─ LPDDR4/LPDDR5: 4-16 GB (mobile)                   │
+│ └─ Bandwidth: 50-100 GB/s (shared with CPU)          │
+│                                                         │
+│ Power: 0.5-5 W (mobile/edge NPUs)                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 입력 처리 단계별 하드웨어 적합성
+
+```
+┌──────────────────────┬──────────┬──────────┬──────────┬─────────────────────┐
+│ Processing Stage     │ CPU      │ GPU      │ NPU      │ Reason              │
+├──────────────────────┼──────────┼──────────┼──────────┼─────────────────────┤
+│ UTF-8 Encoding       │ ★★★★★    │ ☆☆☆☆☆    │ ☆☆☆☆☆    │ Control flow heavy  │
+│ Byte-to-Unicode LUT  │ ★★★★★    │ ★☆☆☆☆    │ ☆☆☆☆☆    │ Small lookup, fast  │
+│ BPE Tokenization     │ ★★★★★    │ ★☆☆☆☆    │ ☆☆☆☆☆    │ Sequential algorithm│
+│ Vocabulary Lookup    │ ★★★★★    │ ★★☆☆☆    │ ☆☆☆☆☆    │ Hash table ops      │
+│ Token Embedding      │ ★★☆☆☆    │ ★★★★★    │ ★★★★☆    │ Memory bandwidth    │
+│ Position Embedding   │ ★★★☆☆    │ ★★★★★    │ ★★★★★    │ Sequential access   │
+│ Embedding Addition   │ ★★★★☆    │ ★★★★★    │ ★★★★★    │ Vector operation    │
+└──────────────────────┴──────────┴──────────┴──────────┴─────────────────────┘
+
+Legend: ★ = Suitability (more stars = better)
+```
+
+### 성능 및 효율성 종합 비교
+
+**시나리오 1: 모바일/엣지 추론 (B=1, L=512)**
+
+```
+┌────────────┬──────────────┬──────────────┬─────────────┬──────────────┐
+│ Hardware   │ Latency      │ Power        │ Energy      │ Notes        │
+├────────────┼──────────────┼──────────────┼─────────────┼──────────────┤
+│ CPU        │ ~1.2 ms      │ 3-5 W        │ ~4.8 mJ     │ Always on    │
+│ (Mobile)   │              │              │             │ Low latency  │
+├────────────┼──────────────┼──────────────┼─────────────┼──────────────┤
+│ GPU        │ Not typical  │ N/A          │ N/A         │ Unavailable  │
+│ (Mobile)   │ (Mali/Adreno)│              │             │ on mobile    │
+├────────────┼──────────────┼──────────────┼─────────────┼──────────────┤
+│ NPU        │ ~800 μs      │ 0.5-1 W      │ ~0.5 mJ     │ BEST choice  │
+│ (A17/M4)   │              │              │             │ 10× efficient│
+└────────────┴──────────────┴──────────────┴─────────────┴──────────────┘
+
+Winner: NPU (for battery life and sustained performance)
+```
+
+**시나리오 2: 서버 추론 (B=1, L=1024)**
+
+```
+┌────────────┬──────────────┬──────────────┬─────────────┬──────────────┐
+│ Hardware   │ Latency      │ Power        │ Energy      │ Notes        │
+├────────────┼──────────────┼──────────────┼─────────────┼──────────────┤
+│ CPU        │ ~2.2 ms      │ 15-65 W      │ ~110 mJ     │ Flexible     │
+│ (Xeon)     │              │              │             │ Easy to code │
+├────────────┼──────────────┼──────────────┼─────────────┼──────────────┤
+│ GPU        │ ~15 μs       │ 50-100 W     │ ~1.5 mJ     │ BEST latency │
+│ (A100)     │ (GPU only)   │              │             │ High throughput
+├────────────┼──────────────┼──────────────┼─────────────┼──────────────┤
+│ NPU        │ Not typical  │ N/A          │ N/A         │ Rare in      │
+│ (Server)   │              │              │             │ servers      │
+└────────────┴──────────────┴──────────────┴─────────────┴──────────────┘
+
+Winner: GPU (for raw speed and throughput)
+```
+
+**시나리오 3: 대규모 배치 추론 (B=128, L=512)**
+
+```
+┌────────────┬──────────────┬──────────────┬─────────────┬──────────────┐
+│ Hardware   │ Throughput   │ Latency/Item │ Efficiency  │ Notes        │
+├────────────┼──────────────┼──────────────┼─────────────┼──────────────┤
+│ CPU        │ ~50 seq/s    │ ~20 ms       │ Low         │ Poor scaling │
+│ (64 cores) │              │              │             │              │
+├────────────┼──────────────┼──────────────┼─────────────┼──────────────┤
+│ GPU        │ ~8000 seq/s  │ ~16 μs       │ High        │ BEST for     │
+│ (A100)     │              │              │             │ large batch  │
+├────────────┼──────────────┼──────────────┼─────────────┼──────────────┤
+│ NPU        │ ~200 seq/s   │ ~640 μs      │ Medium      │ Limited SRAM │
+│ (A17)      │              │              │             │ capacity     │
+└────────────┴──────────────┴──────────────┴─────────────┴──────────────┘
+
+Winner: GPU (by far, for batch processing)
+```
+
+### 하드웨어 선택 가이드
+
+```
+Use CPU when:
+├─ Prototype/development (easiest to code)
+├─ Small-scale deployment (< 100 requests/day)
+├─ Complex preprocessing (BPE tokenization required)
+├─ Variable/unpredictable workloads
+└─ No access to GPU/NPU hardware
+
+Use GPU when:
+├─ High throughput needed (> 1000 requests/sec)
+├─ Large batch sizes (B ≥ 32)
+├─ Training or fine-tuning
+├─ Server/datacenter deployment
+├─ Cost amortized over many requests
+└─ Lowest latency for single requests (B=1 with GPU available)
+
+Use NPU when:
+├─ Mobile/edge devices (smartphones, tablets)
+├─ Battery-powered systems
+├─ Always-on inference (voice assistants, real-time translation)
+├─ Small to medium batches (B=1-16)
+├─ Power budget < 5 W
+├─ Quantized models (INT8/INT16)
+└─ Energy efficiency is critical
+```
+
+### 실전 배포 전략
+
+```
+Hybrid CPU + GPU Strategy (Common in Cloud):
+├─ CPU handles:
+│  ├─ Tokenization (BPE)
+│  ├─ Request routing
+│  ├─ Postprocessing (text generation, sampling)
+│  └─ Small requests (B=1-4)
+│
+└─ GPU handles:
+   ├─ Embedding lookup
+   ├─ Transformer layers
+   ├─ Large batches (B ≥ 16)
+   └─ Batch accumulation from multiple requests
+
+Hybrid CPU + NPU Strategy (Common on Mobile):
+├─ CPU handles:
+│  ├─ Tokenization (BPE)
+│  ├─ App logic, UI updates
+│  ├─ Postprocessing
+│  └─ Dynamic control flow
+│
+└─ NPU handles:
+   ├─ Embedding lookup (quantized)
+   ├─ Transformer layers (quantized)
+   ├─ All tensor operations
+   └─ Runs in background, low power
+
+Example: OpenAI API Backend (Speculative):
+┌─────────────────────────────────────────────────────┐
+│ Request arrives → CPU (tokenize)                    │
+│        ↓                                            │
+│ Batch accumulator (wait for B=32-128)              │
+│        ↓                                            │
+│ Transfer to GPU → Embedding + Transformers         │
+│        ↓                                            │
+│ Transfer back to CPU → Decode, sample, detokenize  │
+│        ↓                                            │
+│ Return response                                     │
+└─────────────────────────────────────────────────────┘
+Achieves: ~15-20 ms latency, 1000+ requests/sec/GPU
+
+Example: Siri/Google Assistant (Speculative):
+┌─────────────────────────────────────────────────────┐
+│ Wake word detection → NPU (always-on, ultra low power)
+│        ↓                                            │
+│ Audio → CPU (preprocessing) → NPU (speech-to-text) │
+│        ↓                                            │
+│ Text → CPU (tokenize) → NPU (LLM inference)        │
+│        ↓                                            │
+│ Response → CPU (text-to-speech) → NPU (vocoder)    │
+│        ↓                                            │
+│ Audio output                                        │
+└─────────────────────────────────────────────────────┘
+Power: ~0.5-2 W average, ~50-100 ms latency
+```
+
+### 미래 트렌드 및 전망
+
+```
+CPU Evolution:
+├─ More vector units (AVX-1024?)
+├─ Specialized AI instructions (AMX, AMX-FP16)
+├─ Tighter integration with accelerators
+└─ Likely to remain for tokenization/control flow
+
+GPU Evolution:
+├─ Larger tensor cores (H100, B100)
+├─ Higher memory bandwidth (3-5 TB/s)
+├─ Better support for sparse operations
+├─ FP8/FP4 precision for efficiency
+└─ Dominant for training, high-throughput inference
+
+NPU Evolution:
+├─ Larger on-chip SRAM (32-64 MB)
+├─ Better INT4/INT2 quantization
+├─ Hybrid architectures (NPU + GPU features)
+├─ Specialized units for transformers (Flash Attention)
+└─ Dominant for mobile/edge, growing in servers
+
+Emerging: Specialized LLM Accelerators
+├─ Groq LPU (Language Processing Unit)
+│  └─ Deterministic, ultra-low latency (~1 ms for GPT-2)
+├─ Cerebras Wafer-Scale Engine
+│  └─ 850,000 cores, 40 GB on-chip SRAM
+├─ Google TPU v5
+│  └─ Optimized for large language models
+└─ Custom ASICs for specific models (e.g., AWS Inferentia)
+```
+
+### 핵심 요약
+
+| 차원 | CPU | GPU | NPU |
+|------|-----|-----|-----|
+| **강점** | 범용성, 저지연, 프로그래밍 용이 | 처리량, 병렬성, 메모리 대역폭 | 전력 효율, 양자화, 온칩 메모리 |
+| **약점** | 처리량 낮음, 전력 비효율 | 전력 소모 큼, 전송 오버헤드 | 유연성 부족, SRAM 제한, 처리량 낮음 |
+| **Best for** | 토큰화, 전처리, 개발 | 대규모 배치, 학습, 클라우드 | 모바일, 엣지, 배터리 기기 |
+| **Cost** | 낮음-중간 | 높음 (GPU 가격) | 낮음 (통합형) |
+| **Maturity** | 매우 성숙 | 성숙 | 빠르게 발전 중 |
+
+**입력 처리에 대한 최종 결론:**
+- **토큰화**: CPU 필수 (BPE는 순차적)
+- **임베딩 룩업**: GPU > NPU > CPU (메모리 대역폭 게임)
+- **벡터 연산**: NPU ≈ GPU >> CPU (전력 효율 vs 처리량)
+- **실전**: 하이브리드 접근 (CPU 토큰화 + GPU/NPU 임베딩)
