@@ -929,22 +929,173 @@ Memory (critical!):
 ```
 
 **Step 3: Softmax**
+
+**인덱스 설명:**
 ```
-For each head, each query position:
-  scores[h, i, :] → softmax → attn_weights[h, i, :]
+scores shape: [B, H, L, L] = [1, 12, 1024, 1024]
+                 ↑  ↑   ↑    ↑
+                 B  h   i    j
 
-Operations per position:
-├─ exp(x_i): 1024 exp operations
-├─ sum: 1024 additions
-├─ divide: 1024 divisions
-└─ Total: ~3,072 ops per position
+h = head index     (0~11, 총 12개 헤드)
+i = query position (0~L-1, "내가 어디서 보고 있나")
+j = key position   (0~L-1, "어디를 보고 있나")
 
-Total: 12 heads × 1024 positions × 3,072 = 37.7M ops
+scores[h, i, :] → 헤드 h에서, 위치 i의 토큰이 모든 위치(j=0~L-1)를 얼마나 attend하는지
+```
 
-Memory:
+**Softmax 상세 연산:**
+```
+scores[h, i, :] = [s₀, s₁, s₂, ..., s₁₀₂₃]  ← 1024개 값 (raw attention scores)
+                         ↓ softmax
+attn_weights[h, i, :] = [a₀, a₁, a₂, ..., a₁₀₂₃]  ← 합이 1인 확률 분포
+```
+
+```python
+def softmax(scores):
+    """
+    scores: [1024] - 한 query position의 모든 key에 대한 점수
+    """
+    # Step 1: Numerical Stability (max subtraction)
+    # exp(큰 값) → overflow 방지
+    max_score = max(scores)           # 1023 comparisons
+    scores = scores - max_score       # 1024 subtractions
+
+    # Step 2: Exponential
+    exp_scores = exp(scores)          # 1024 exp operations
+
+    # Step 3: Sum
+    sum_exp = sum(exp_scores)         # 1023 additions
+
+    # Step 4: Normalize (divide)
+    attn_weights = exp_scores / sum_exp  # 1024 divisions
+
+    return attn_weights
+```
+
+**연산 카운트 (정확한 버전):**
+```
+Per softmax (1024 elements):
+┌─────────────────────┬────────────┬─────────────────────┐
+│ Operation           │ Count      │ Notes               │
+├─────────────────────┼────────────┼─────────────────────┤
+│ Find max            │ 1,023      │ Comparisons         │
+│ Subtract max        │ 1,024      │ Subtractions        │
+│ Exponential         │ 1,024      │ exp() - expensive!  │
+│ Sum                 │ 1,023      │ Additions           │
+│ Divide              │ 1,024      │ Divisions           │
+├─────────────────────┼────────────┼─────────────────────┤
+│ Total               │ 5,118      │ Per softmax call    │
+└─────────────────────┴────────────┴─────────────────────┘
+
+Total softmax calls: H × L = 12 × 1024 = 12,288
+Total operations: 12,288 × 5,118 = 62.9M ops
+```
+
+**Causal Mask와 Softmax:**
+```
+GPT-2는 causal (autoregressive) → 미래 토큰 못 봄
+
+Position i=2인 경우 (3번째 토큰):
+scores[h, 2, :] = [s₀, s₁, s₂, -∞, -∞, -∞, ..., -∞]
+                   ↑   ↑   ↑   ↑
+                  볼수있음   masked (future tokens)
+
+softmax 후:
+attn[h, 2, :] = [0.3, 0.5, 0.2, 0, 0, 0, ..., 0]
+                 ↑              ↑
+              합 = 1.0      exp(-∞) = 0
+
+실제 연산량 (삼각형 구조):
+├─ Position 0: softmax over 1 element
+├─ Position 1: softmax over 2 elements
+├─ Position i: softmax over (i+1) elements
+└─ 평균: L/2 elements per softmax
+   → 이론적으로 ~절반 연산 절약 가능 (sparse 구현시)
+```
+
+**시각화 예시:**
+```
+Head h=0, Query position i=3 ("world"가 attend하는 패턴):
+
+     j=0     j=1    j=2    j=3    j=4    j=5  ...
+    "Hello"  ","    " "   "world" [MASK] [MASK]
+      ↓       ↓      ↓      ↓       ↓      ↓
+     0.1     0.3   0.05   0.55     0      0    ← attn_weights[0, 3, :]
+      ↑                     ↑
+ 약간 attention        자기 자신에게 많이
+
+softmax 보장:
+├─ 모든 값 ≥ 0
+├─ 합 = 1.0 (확률 분포)
+└─ masked position = 0 (exp(-∞) = 0)
+```
+
+**exp() 하드웨어 구현:**
+```
+exp()는 softmax에서 가장 비싼 연산:
+┌─────────────────────────────────────────────────────────┐
+│ CPU:  ~15-20 cycles per exp (SIMD: vexpps)             │
+│ GPU:  SFU (Special Function Unit), ~8 cycles           │
+│ NPU:  LUT + polynomial approximation, ~2-4 cycles      │
+│                                                         │
+│ 최적화: exp(x) = 2^(x/ln2) = 2^(x × 1.4427)            │
+│         2^x는 bit manipulation으로 빠르게 근사 가능      │
+│         (IEEE 754 지수부 직접 조작)                     │
+└─────────────────────────────────────────────────────────┘
+
+하드웨어별 exp 구현:
+┌──────────┬────────────────────────────────────────────┐
+│ Hardware │ exp() Implementation                       │
+├──────────┼────────────────────────────────────────────┤
+│ Intel CPU│ vexpps (AVX-512): ~4 cycles/8 elements    │
+│          │ 또는 LUT + Taylor series                   │
+├──────────┼────────────────────────────────────────────┤
+│ NVIDIA   │ SFU: __expf() ~8 cycles                   │
+│ GPU      │ Full precision: expf() ~20 cycles         │
+├──────────┼────────────────────────────────────────────┤
+│ NPU      │ Piecewise polynomial (degree 2-3)         │
+│          │ 또는 small LUT + linear interpolation     │
+└──────────┴────────────────────────────────────────────┘
+```
+
+**Online Softmax (Flash Attention 핵심):**
+```
+기존 방식 (메모리 비효율):
+┌─────────────────────────────────────────────────────────┐
+│ 1. scores 전체 계산 → 48 MB 저장                        │
+│ 2. max 찾기 (전체 스캔)                                 │
+│ 3. exp 계산 → 48 MB 저장                               │
+│ 4. sum 계산 (전체 스캔)                                 │
+│ 5. divide → 48 MB 저장                                 │
+│ 메모리: O(L²) = 48 MB                                   │
+└─────────────────────────────────────────────────────────┘
+
+Online Softmax (streaming):
+┌─────────────────────────────────────────────────────────┐
+│ max, sum을 streaming으로 동시 계산:                     │
+│                                                         │
+│ m = -∞, d = 0  (running max, running denominator)      │
+│ for each score s:                                       │
+│     m_new = max(m, s)                                   │
+│     d_new = d × exp(m - m_new) + exp(s - m_new)        │
+│     m, d = m_new, d_new                                │
+│                                                         │
+│ 메모리: O(1) - max, sum 두 개만 유지!                   │
+│ Flash Attention이 이 방식 사용                          │
+│ → 48 MB attention matrix를 SRAM에 안 써도 됨           │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Memory:**
+```
 ├─ Read scores: 48 MB
 ├─ Write attn_weights: 48 MB
 └─ Total: 96 MB (read + write)
+
+Flash Attention 사용시:
+├─ Tiled computation in SRAM
+├─ Never materialize full 48 MB matrix
+└─ ~10× memory bandwidth 절약
 ```
 
 **Step 4: Attention × Value**
